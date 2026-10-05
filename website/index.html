@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="uz">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#07070b">
+  <title>Navbatchi Dashboard</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="app.js" defer></script>
+</head>
+<body>
+
+  <!-- 1. HEADER: title, bot status, live Tashkent clock -->
+  <header class="header">
+    <h1 class="brand">Navbatchi nazorati</h1>
+    <div class="header__meta">
+      <span class="status"><i class="status__dot"></i>Bot faol</span>
+      <time id="clock" class="clock" aria-label="Toshkent vaqti">--:--:--</time>
+    </div>
+  </header>
+
+  <main class="layout">
+
+    <!-- 2. HERO: today's duty -->
+    <section class="card hero" id="hero" aria-labelledby="hero-title">
+      <p class="hero__label" id="hero-title">Bugungi navbatchi</p>
+      <h2 class="hero__name" id="hero-name">Yuklanmoqda…</h2>
+      <p class="hero__user" id="hero-user"></p>
+      <p class="hero__date" id="hero-date"></p>
+      <button class="btn btn--primary" id="done-btn" type="button">Bajarildi deb belgilash</button>
+    </section>
+
+    <!-- 3. UPCOMING SCHEDULE (filled by app.js) -->
+    <section class="card" aria-labelledby="sched-title">
+      <h2 class="card__title" id="sched-title">Navbatchilik jadvali <span>Keyingi 13 kun</span></h2>
+      <ol class="schedule" id="schedule"></ol>
+    </section>
+
+    <!-- 4. MEMBERS ROSTER (filled by app.js) -->
+    <section class="card" aria-labelledby="roster-title">
+      <h2 class="card__title" id="roster-title">Jamoa a’zolari <span id="member-count"></span></h2>
+      <div class="roster" id="roster"></div>
+    </section>
+
+    <!-- 5. ADMIN CONTROLS (mockup) -->
+    <section class="card" aria-labelledby="admin-title">
+      <h2 class="card__title" id="admin-title">Boshqaruv</h2>
+      <div class="admin">
+        <button class="btn" type="button" data-action="shuffle">Jadvalni aralashtirish</button>
+        <button class="btn" type="button" data-action="add">A’zo qo‘shish</button>
+        <button class="btn btn--danger" type="button" data-action="skip">Navbatni o‘tkazish</button>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- Toast notifications -->
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+</body>
+</html>
