@@ -3,6 +3,7 @@
 import asyncio
 import re
 import unittest
+from copy import deepcopy
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
@@ -25,7 +26,7 @@ import test_bot as fixtures
 bot = fixtures.bot
 PUBLIC_COMMANDS = {"start", "bugun", "jadval"}
 MANAGEMENT_COMMANDS = {
-    "setup", "admin", "odamlar", "bajarildi", "elon", "tarix", "zaxira",
+    "admin", "odamlar", "bajarildi", "elon", "tarix", "zaxira",
     "ism_qosh", "ism_ochir", "bekor",
 }
 
@@ -70,22 +71,22 @@ class CommandMenuTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(calls)
                 for call in calls:
                     names = self.command_names(call)
-                    self.assertTrue(PUBLIC_COMMANDS.issubset(names))
+                    self.assertEqual(names, PUBLIC_COMMANDS)
                     self.assertTrue(MANAGEMENT_COMMANDS.isdisjoint(names))
                     self.assertNotIn("royxat", names)
                     self.assertNotIn("cancel", names)
 
-    async def test_group_administrators_get_management_commands(self):
+    async def test_group_administrators_get_only_public_commands(self):
         await bot.register_bot_commands(self.context.application)
         calls = self.scope_calls(BotCommandScopeAllChatAdministrators)
         self.assertTrue(calls)
         for call in calls:
             names = self.command_names(call)
-            self.assertTrue((PUBLIC_COMMANDS | MANAGEMENT_COMMANDS).issubset(names))
+            self.assertEqual(names, PUBLIC_COMMANDS)
             self.assertNotIn("royxat", names)
             self.assertNotIn("cancel", names)
 
-    async def test_configured_admin_has_private_and_linked_group_member_scopes(self):
+    async def test_configured_admin_gets_management_only_in_private_scope(self):
         await bot.register_bot_commands(self.context.application)
         private_calls = [call for call in self.scope_calls(BotCommandScopeChat)
                          if call.kwargs["scope"].chat_id == fixtures.GLOBAL_ADMIN_ID]
@@ -94,9 +95,19 @@ class CommandMenuTests(unittest.IsolatedAsyncioTestCase):
                        and call.kwargs["scope"].user_id == fixtures.GLOBAL_ADMIN_ID]
         self.assertTrue(private_calls)
         self.assertTrue(group_calls)
-        for call in private_calls + group_calls:
+        for call in private_calls:
             self.assertTrue((PUBLIC_COMMANDS | MANAGEMENT_COMMANDS).issubset(self.command_names(call)))
+        for call in group_calls:
+            self.assertEqual(self.command_names(call), PUBLIC_COMMANDS)
         self.api.get_chat_member.assert_not_awaited()
+
+    async def test_startup_registers_public_member_scopes_in_every_subscribed_group(self):
+        other_group_id = -100987654
+        bot.remember_group(Chat(id=other_group_id, type=Chat.SUPERGROUP))
+        await bot.register_bot_commands(self.context.application)
+        calls = self.scope_calls(BotCommandScopeChatMember)
+        self.assertEqual({call.kwargs["scope"].chat_id for call in calls}, {fixtures.GROUP_ID, other_group_id})
+        self.assertTrue(all(self.command_names(call) == PUBLIC_COMMANDS for call in calls))
 
     async def test_registered_command_metadata_is_accepted_by_telegram(self):
         await bot.register_bot_commands(self.context.application)
@@ -104,6 +115,7 @@ class CommandMenuTests(unittest.IsolatedAsyncioTestCase):
         for call in self.api.set_my_commands.await_args_list:
             commands = call.kwargs.get("commands", call.args[0] if call.args else ())
             self.assertNotIn("id", self.command_names(call))
+            self.assertNotIn("setup", self.command_names(call))
             self.assertGreater(len(commands), 0)
             self.assertLessEqual(len(commands), 100)
             self.assertEqual(len(commands), len({command.command for command in commands}))
@@ -186,11 +198,12 @@ class CommandMenuTests(unittest.IsolatedAsyncioTestCase):
         for target in (None, fixtures.GLOBAL_ADMIN_ID):
             with self.subTest(target=target):
                 self.store.state["chat_id"] = target
+                self.store.state.pop("group_subscriptions", None)
                 self.api.set_my_commands.reset_mock()
                 await bot.register_bot_commands(self.context.application)
                 self.assertEqual(self.scope_calls(BotCommandScopeChatMember), [])
 
-    async def test_setup_registers_global_admin_suggestions_in_new_group(self):
+    async def test_setup_registers_public_suggestions_for_configured_admin_in_new_group(self):
         new_group_id = -100987654
         self.store.state["chat_id"] = fixtures.GROUP_ID
         await bot.setup(self.update(fixtures.GLOBAL_ADMIN_ID, text="/setup", chat_id=new_group_id), self.context)
@@ -198,7 +211,7 @@ class CommandMenuTests(unittest.IsolatedAsyncioTestCase):
                  if call.kwargs["scope"].chat_id == new_group_id
                  and call.kwargs["scope"].user_id == fixtures.GLOBAL_ADMIN_ID]
         self.assertTrue(calls)
-        self.assertTrue(MANAGEMENT_COMMANDS.issubset(self.command_names(calls[-1])))
+        self.assertEqual(self.command_names(calls[-1]), PUBLIC_COMMANDS)
 
     async def test_network_failure_retries_only_failed_scope_on_next_announcement_check(self):
         rejected = False
@@ -227,12 +240,12 @@ class CommandMenuTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.context.application.bot_data.get("command_menu_retry"))
         publish.assert_awaited_once_with(self.context.application)
 
-    async def test_rate_limited_admin_scope_retries_with_management_commands(self):
+    async def test_rate_limited_private_admin_scope_retries_with_management_commands(self):
         rejected = False
 
         async def rate_limit_admin_once(commands, scope=None, **kwargs):
             nonlocal rejected
-            if isinstance(scope, BotCommandScopeAllChatAdministrators) and not rejected:
+            if isinstance(scope, BotCommandScopeChat) and scope.chat_id == fixtures.GLOBAL_ADMIN_ID and not rejected:
                 rejected = True
                 raise RetryAfter(120)
             return True
@@ -245,7 +258,7 @@ class CommandMenuTests(unittest.IsolatedAsyncioTestCase):
             self.assertLogs("navbatchilik", level="WARNING"),
         ):
             await bot.register_bot_commands(self.context.application)
-        self.assertEqual(self.scope_calls(BotCommandScopeChat), [])
+        self.assertEqual(len(self.scope_calls(BotCommandScopeChat)), 1)
         self.assertEqual(self.scope_calls(BotCommandScopeChatMember), [])
         self.api.set_chat_menu_button.assert_not_awaited()
         self.api.set_my_commands.reset_mock()
@@ -265,12 +278,13 @@ class CommandMenuTests(unittest.IsolatedAsyncioTestCase):
             patch.object(bot, "publish_today_if_due", AsyncMock(return_value=False)),
         ):
             await bot.daily_announcement(self.context)
-        admin_calls = self.scope_calls(BotCommandScopeAllChatAdministrators)
+        admin_calls = self.scope_calls(BotCommandScopeChat)
         self.assertEqual(len(admin_calls), 1)
         call = admin_calls[0]
         self.assertTrue(MANAGEMENT_COMMANDS.issubset(self.command_names(call)))
         self.assertEqual(len(self.scope_calls(BotCommandScopeChat)), 1)
         self.assertEqual(len(self.scope_calls(BotCommandScopeChatMember)), 1)
+        self.assertEqual(self.command_names(self.scope_calls(BotCommandScopeChatMember)[0]), PUBLIC_COMMANDS)
         self.api.set_chat_menu_button.assert_awaited_once()
         self.assertFalse(self.context.application.bot_data.get("command_menu_retry"))
 
@@ -319,37 +333,41 @@ class CommandMenuTests(unittest.IsolatedAsyncioTestCase):
                 self.api.set_my_commands.assert_not_awaited()
                 publish.assert_awaited_once_with(self.context.application)
 
-    async def test_first_group_commands_register_configured_admin_suggestions(self):
+    async def test_first_group_commands_register_public_suggestions_for_configured_admin(self):
         new_group_id = -100987654
         for handler in (bot.start, bot.bugun, bot.jadval):
             with self.subTest(handler=handler.__name__):
                 self.store.state["chat_id"] = None
+                self.store.state.pop("group_subscriptions", None)
                 self.api.set_my_commands.reset_mock()
                 await handler(self.update(text=f"/{handler.__name__}", chat_id=new_group_id), self.context)
                 calls = [call for call in self.scope_calls(BotCommandScopeChatMember)
                          if call.kwargs["scope"].chat_id == new_group_id
                          and call.kwargs["scope"].user_id == fixtures.GLOBAL_ADMIN_ID]
                 self.assertTrue(calls)
-                self.assertTrue(MANAGEMENT_COMMANDS.issubset(self.command_names(calls[-1])))
+                self.assertEqual(self.command_names(calls[-1]), PUBLIC_COMMANDS)
 
-    async def test_bot_addition_or_promotion_refreshes_configured_admin_suggestions(self):
+    async def test_bot_addition_or_promotion_refreshes_public_suggestions_for_configured_admin(self):
         for administrator in (False, True):
             with self.subTest(administrator=administrator):
                 self.store.state["chat_id"] = None
+                self.store.state.pop("group_subscriptions", None)
                 self.api.set_my_commands.reset_mock()
                 await bot.on_membership_change(self.membership_update(administrator=administrator), self.context)
                 calls = [call for call in self.scope_calls(BotCommandScopeChatMember)
                          if call.kwargs["scope"].chat_id == fixtures.GROUP_ID
                          and call.kwargs["scope"].user_id == fixtures.GLOBAL_ADMIN_ID]
                 self.assertTrue(calls)
+                self.assertEqual(self.command_names(calls[-1]), PUBLIC_COMMANDS)
 
-    async def test_group_migration_registers_configured_admin_suggestions_for_new_id(self):
+    async def test_group_migration_registers_public_suggestions_for_configured_admin_new_id(self):
         new_group_id = -100987654
         await bot.on_group_migration(self.update(migrate_to=new_group_id), self.context)
         calls = self.scope_calls(BotCommandScopeChatMember)
         self.assertTrue(calls)
         self.assertTrue(all(call.kwargs["scope"].chat_id == new_group_id for call in calls))
         self.assertTrue(any(call.kwargs["scope"].user_id == fixtures.GLOBAL_ADMIN_ID for call in calls))
+        self.assertTrue(all(self.command_names(call) == PUBLIC_COMMANDS for call in calls))
 
     async def test_setup_network_failure_retries_without_dropping_existing_failed_scope(self):
         await self.queue_public_scope_failure()
@@ -364,6 +382,7 @@ class CommandMenuTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.scope_calls(BotCommandScopeAllPrivateChats))
         group_calls = self.scope_calls(BotCommandScopeChatMember)
         self.assertTrue(any(call.kwargs["scope"].chat_id == new_group_id for call in group_calls))
+        self.assertTrue(all(self.command_names(call) == PUBLIC_COMMANDS for call in group_calls))
         self.assertFalse(self.context.application.bot_data.get("command_menu_retry"))
 
     async def test_private_start_network_failure_retries_without_dropping_existing_failed_scope(self):
@@ -450,6 +469,33 @@ class CommandMenuTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(self.api.set_my_commands.await_args.kwargs["scope"], BotCommandScopeChat)
         self.assertFalse(self.context.application.bot_data.get("command_menu_retry"))
         self.assertIsNone(self.context.application.bot_data.get("command_menu_retry_after"))
+
+    async def test_group_command_refresh_subscribes_group_without_changing_duty_and_is_cached(self):
+        new_group_id = -100987654
+        before = deepcopy(self.store.state)
+        await bot.refresh_group_command_menu(
+            self.update(fixtures.GLOBAL_ADMIN_ID, text="/bugun", chat_id=new_group_id), self.context,
+        )
+        first_count = self.api.set_my_commands.await_count
+        self.assertGreater(first_count, 0)
+        for call in self.api.set_my_commands.await_args_list:
+            self.assertEqual(self.command_names(call), PUBLIC_COMMANDS)
+        await bot.refresh_group_command_menu(
+            self.update(fixtures.GLOBAL_ADMIN_ID, text="/jadval", chat_id=new_group_id), self.context,
+        )
+        self.assertEqual(self.api.set_my_commands.await_count, first_count)
+        await bot.refresh_group_command_menu(
+            self.update(fixtures.GLOBAL_ADMIN_ID, text="/start", chat_id=fixtures.GLOBAL_ADMIN_ID,
+                        chat_type=Chat.PRIVATE), self.context,
+        )
+        self.assertEqual(self.api.set_my_commands.await_count, first_count)
+        self.api.send_message.assert_not_awaited()
+        self.api.delete_message.assert_not_awaited()
+        self.store.ensure_assignment_through.assert_not_called()
+        self.store.start_new_round_today.assert_not_called()
+        self.store.save_state.assert_called_once()
+        self.assertIn(str(new_group_id), bot.subscribed_groups())
+        self.assertEqual({key: self.store.state[key] for key in before}, before)
 
 
 if __name__ == "__main__":

@@ -693,6 +693,15 @@ class _StateProxy:
         raw = self._store._get_state_key(key)
         if raw is None:
             return default
+        if key == "group_subscriptions":
+            try:
+                groups = json.loads(raw)
+                if not isinstance(groups, dict):
+                    raise ValueError("expected a JSON object")
+            except (TypeError, ValueError) as exc:
+                log.warning("Invalid group_subscriptions in bot_state: %s", exc)
+                return default
+            return groups
         # Deserialize booleans stored as strings
         if raw.lower() == "true":
             return True
@@ -724,6 +733,11 @@ class _StateProxy:
     def __setitem__(self, key: str, value: Any) -> None:
         if value is None:
             self._store._set_state_key(key, None)
+        elif key == "group_subscriptions":
+            if not isinstance(value, dict):
+                raise ValueError("group_subscriptions must be a dictionary.")
+            encoded = json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+            self._store._set_state_key(key, encoded)
         elif key == "round_order" and isinstance(value, list):
             self._store._set_state_key(key, ",".join(str(v) for v in value))
         elif isinstance(value, bool):

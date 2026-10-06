@@ -8,6 +8,7 @@ only the database and Bot network methods are mocked.
 import importlib
 import os
 import unittest
+from copy import deepcopy
 from datetime import date, datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -263,6 +264,15 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(await bot.can_manage(update, self.context))
                 self.api.get_chat_member.assert_not_awaited()
 
+    async def test_other_subscribed_group_admin_cannot_manage_shared_roster_without_global_role(self):
+        other_group_id = -100987654
+        bot.remember_group(Chat(id=other_group_id, type=Chat.SUPERGROUP))
+        self.allow_group_admin()
+        self.assertFalse(await bot.can_manage(self.update(GROUP_ADMIN_ID, chat_id=other_group_id), self.context))
+        self.api.get_chat_member.assert_not_awaited()
+        self.assertTrue(await bot.can_manage(self.update(GLOBAL_ADMIN_ID, chat_id=other_group_id), self.context))
+        self.assertEqual(self.store.state["chat_id"], GROUP_ID)
+
     async def test_membership_lookup_error_fails_closed(self):
         self.api.get_chat_member.side_effect = TelegramError("offline permission lookup")
         with self.assertLogs("navbatchilik", level="WARNING"):
@@ -311,6 +321,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         for linked, chat_type in ((None, Chat.GROUP), (GLOBAL_ADMIN_ID, Chat.SUPERGROUP)):
             with self.subTest(linked=linked):
                 self.store.state["chat_id"] = linked
+                self.store.state.pop("group_subscriptions", None)
                 self.store.state["last_announced_date"] = DAY.isoformat()
                 self.store.state["last_message_id"] = 500
                 self.store.save_state.reset_mock()
@@ -320,15 +331,26 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNone(self.store.state["last_message_id"])
                 self.store.save_state.assert_called_once()
 
-    def test_existing_group_subscription_is_not_claimed_by_another_group(self):
-        for linked in (GROUP_ID, -100987654):
-            with self.subTest(linked=linked):
-                self.store.state["chat_id"] = linked
-                self.store.state["last_announced_date"] = DAY.isoformat()
-                before = dict(self.store.state)
-                bot.remember_group(Chat(id=GROUP_ID, type=Chat.SUPERGROUP))
-                self.assertEqual(self.store.state, before)
-                self.store.save_state.assert_not_called()
+    def test_new_group_subscription_coexists_with_primary_and_preserves_round(self):
+        other_group_id = -100987654
+        self.store.state["last_announced_date"] = DAY.isoformat()
+        self.store.state["last_message_id"] = 500
+        before = deepcopy(self.store.state)
+        self.assertTrue(bot.remember_group(Chat(id=other_group_id, type=Chat.SUPERGROUP)))
+        subscriptions = bot.subscribed_groups()
+        self.assertEqual(set(subscriptions), {str(GROUP_ID), str(other_group_id)})
+        self.assertEqual(subscriptions[str(GROUP_ID)]["last_announced_date"], DAY.isoformat())
+        self.assertEqual(subscriptions[str(GROUP_ID)]["last_message_id"], 500)
+        self.assertIsNone(subscriptions[str(other_group_id)]["last_announced_date"])
+        self.assertEqual({key: self.store.state[key] for key in before}, before)
+        self.store.save_state.assert_called_once()
+        self.assertFalse(bot.remember_group(Chat(id=other_group_id, type=Chat.SUPERGROUP)))
+        self.store.save_state.assert_called_once()
+
+    def test_explicit_empty_subscriptions_do_not_restore_legacy_primary(self):
+        self.store.state["group_subscriptions"] = {}
+        self.assertEqual(bot.subscribed_groups(), {})
+        self.store.save_state.assert_not_called()
 
     def test_private_chat_and_channel_do_not_subscribe_for_daily_messages(self):
         self.store.state["chat_id"] = None
@@ -344,6 +366,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         for handler in (bot.bugun, bot.jadval):
             with self.subTest(handler=handler.__name__):
                 self.store.state["chat_id"] = None
+                self.store.state.pop("group_subscriptions", None)
                 self.store.state["last_announced_date"] = DAY.isoformat()
                 self.store.save_state.reset_mock()
                 await handler(self.update(text=f"/{handler.__name__}"), self.context)
@@ -356,6 +379,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         for administrator in (False, True):
             with self.subTest(administrator=administrator):
                 self.store.state["chat_id"] = None
+                self.store.state.pop("group_subscriptions", None)
                 self.store.state["last_announced_date"] = DAY.isoformat()
                 self.store.save_state.reset_mock()
                 await bot.on_membership_change(self.membership_update(administrator=administrator), self.context)
@@ -368,7 +392,8 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.store.state["last_announced_date"] = DAY.isoformat()
         self.store.state["last_message_id"] = 500
         await bot.on_membership_change(self.membership_update(added=False), self.context)
-        self.assertIsNone(self.store.state["chat_id"])
+        self.assertEqual(self.store.state["chat_id"], GROUP_ID)
+        self.assertEqual(bot.subscribed_groups(), {})
         self.assertIsNone(self.store.state["last_announced_date"])
         self.assertIsNone(self.store.state["last_message_id"])
         self.store.save_state.assert_called_once()
@@ -380,6 +405,30 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.state, before)
         self.store.save_state.assert_not_called()
 
+    async def test_bot_leaving_primary_group_preserves_other_subscriptions_and_duty(self):
+        other_group_id = -100987654
+        bot.remember_group(Chat(id=other_group_id, type=Chat.SUPERGROUP))
+        before = {key: deepcopy(self.store.state[key]) for key in (
+            "round_order", "round_position", "round_number", "today_duty_id", "today_duty_date",
+        )}
+        await bot.on_membership_change(self.membership_update(added=False), self.context)
+        self.assertEqual(set(bot.subscribed_groups()), {str(other_group_id)})
+        self.assertEqual(self.store.state["chat_id"], GROUP_ID)
+        self.allow_group_admin()
+        self.assertFalse(await bot.can_manage(self.update(GROUP_ADMIN_ID, chat_id=other_group_id), self.context))
+        self.assertEqual({key: self.store.state[key] for key in before}, before)
+
+    async def test_bot_leaving_secondary_group_preserves_primary_delivery(self):
+        other_group_id = -100987654
+        self.store.state["last_announced_date"] = DAY.isoformat()
+        self.store.state["last_message_id"] = 500
+        bot.remember_group(Chat(id=other_group_id, type=Chat.SUPERGROUP))
+        primary = deepcopy(bot.subscribed_groups()[str(GROUP_ID)])
+        await bot.on_membership_change(self.membership_update(added=False, chat_id=other_group_id), self.context)
+        self.assertEqual(bot.subscribed_groups(), {str(GROUP_ID): primary})
+        self.assertEqual(self.store.state["chat_id"], GROUP_ID)
+        self.assertEqual(self.store.state["last_announced_date"], DAY.isoformat())
+
     async def test_group_migration_changes_target_and_preserves_round(self):
         new_group_id = -100222333
         updates = (
@@ -389,23 +438,94 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         for update in updates:
             with self.subTest(chat_id=update.effective_chat.id):
                 self.store.state["chat_id"] = GROUP_ID
+                self.store.state.pop("group_subscriptions", None)
                 self.store.state["last_announced_date"] = DAY.isoformat()
                 self.store.state["last_message_id"] = 500
                 self.store.save_state.reset_mock()
                 preserved = {key: value for key, value in self.store.state.items()
-                             if key not in {"chat_id", "last_message_id"}}
+                             if key not in {"chat_id", "last_message_id", "group_subscriptions"}}
                 await bot.on_group_migration(update, self.context)
                 self.assertEqual(self.store.state["chat_id"], new_group_id)
-                self.assertIsNone(self.store.state["last_message_id"])
+                subscriptions = bot.subscribed_groups()
+                self.assertNotIn(str(GROUP_ID), subscriptions)
+                self.assertEqual(subscriptions[str(new_group_id)]["last_announced_date"], DAY.isoformat())
+                self.assertIsNone(subscriptions[str(new_group_id)]["last_message_id"])
                 self.assertEqual({key: self.store.state[key] for key in preserved}, preserved)
                 self.store.start_new_round_today.assert_not_called()
                 self.store.save_state.assert_called_once()
 
-    async def test_unrelated_group_migration_does_not_change_target(self):
-        before = dict(self.store.state)
-        await bot.on_group_migration(self.update(chat_id=-100987654, migrate_to=-100222333), self.context)
+    async def test_unknown_group_migration_subscribes_new_group_and_preserves_primary_and_rotation(self):
+        new_group_id = -100222333
+        before = deepcopy(self.store.state)
+        await bot.on_group_migration(self.update(chat_id=-100987654, migrate_to=new_group_id), self.context)
+        self.assertEqual({key: self.store.state[key] for key in before}, before)
+        self.assertIn(str(new_group_id), bot.subscribed_groups())
+        self.store.save_state.assert_called_once()
+
+    async def test_repeated_unknown_migration_preserves_existing_new_group_delivery(self):
+        new_group_id = -100222333
+        bot.remember_group(Chat(id=new_group_id, type=Chat.SUPERGROUP, title="Existing"))
+        subscriptions = bot.subscribed_groups()
+        subscriptions[str(new_group_id)].update(
+            last_announced_date=DAY.isoformat(), last_message_id=888,
+            last_announced_round_number=7, last_announced_member_id="alice",
+        )
+        self.store.state["group_subscriptions"] = subscriptions
+        before = deepcopy(subscriptions[str(new_group_id)])
+        await bot.on_group_migration(self.update(chat_id=-100987654, migrate_to=new_group_id), self.context)
+        self.assertEqual(bot.subscribed_groups()[str(new_group_id)], before)
+        self.assertEqual(self.store.state["chat_id"], GROUP_ID)
+
+    async def test_secondary_group_migration_keeps_primary_and_preserves_subscription(self):
+        old_group_id = -100987654
+        new_group_id = -100222333
+        bot.remember_group(Chat(id=old_group_id, type=Chat.GROUP))
+        before = deepcopy(bot.subscribed_groups())
+        await bot.on_group_migration(self.update(chat_id=old_group_id, chat_type=Chat.GROUP,
+                                               migrate_to=new_group_id), self.context)
+        subscriptions = bot.subscribed_groups()
+        self.assertEqual(self.store.state["chat_id"], GROUP_ID)
+        self.assertEqual(subscriptions[str(GROUP_ID)], before[str(GROUP_ID)])
+        self.assertNotIn(str(old_group_id), subscriptions)
+        self.assertEqual(subscriptions[str(new_group_id)], before[str(old_group_id)])
+
+    async def test_both_migration_service_events_are_idempotent(self):
+        new_group_id = -100222333
+        await bot.on_group_migration(self.update(chat_type=Chat.GROUP, migrate_to=new_group_id), self.context)
+        before = deepcopy(self.store.state)
+        self.store.save_state.reset_mock()
+        await bot.on_group_migration(self.update(chat_id=new_group_id, migrate_from=GROUP_ID), self.context)
         self.assertEqual(self.store.state, before)
+        self.assertEqual(set(bot.subscribed_groups()), {str(new_group_id)})
         self.store.save_state.assert_not_called()
+
+    async def test_migration_service_refresh_cannot_create_duplicate_group_subscriptions(self):
+        new_group_id = -100222333
+        self.store.state["last_announced_date"] = DAY.isoformat()
+        original = deepcopy(bot.subscribed_groups()[str(GROUP_ID)])
+        updates = (
+            self.update(chat_id=new_group_id, migrate_from=GROUP_ID),
+            self.update(chat_type=Chat.GROUP, migrate_to=new_group_id),
+        )
+        for update in updates:
+            await bot.refresh_group_command_menu(update, self.context)
+            await bot.on_group_migration(update, self.context)
+        subscriptions = bot.subscribed_groups()
+        self.assertEqual(set(subscriptions), {str(new_group_id)})
+        self.assertEqual(subscriptions[str(new_group_id)]["subscription_id"], original["subscription_id"])
+        self.assertEqual(subscriptions[str(new_group_id)]["last_announced_date"], DAY.isoformat())
+
+    async def test_own_bot_left_service_update_does_not_resubscribe_removed_group(self):
+        await bot.on_membership_change(self.membership_update(added=False), self.context)
+        message = Message(
+            message_id=101, date=datetime(2026, 10, 5, 10, 0, tzinfo=timezone.utc),
+            chat=Chat(id=GROUP_ID, type=Chat.SUPERGROUP), from_user=self.user(GLOBAL_ADMIN_ID),
+            left_chat_member=User(id=self.api.id, first_name="Duty Bot", is_bot=True),
+        )
+        message.set_bot(self.api)
+        await bot.refresh_group_command_menu(Update(update_id=2, message=message), self.context)
+        self.assertEqual(bot.subscribed_groups(), {})
+        self.assertEqual(self.store.state["chat_id"], GROUP_ID)
 
     async def test_group_duty_and_schedule_tag_users_without_deleting_commands(self):
         for handler, handles in ((bot.bugun, ["@alice_one"]),
@@ -471,14 +591,18 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(self.store.state, before)
                 self.assert_no_management_mutation()
 
-    async def test_configured_admin_can_link_or_move_group(self):
+    async def test_configured_admin_setup_selects_primary_and_preserves_other_subscriptions(self):
         for linked in (None, -100987654):
             with self.subTest(linked=linked):
                 self.store.state["chat_id"] = linked
+                self.store.state.pop("group_subscriptions", None)
                 self.store.start_new_round_today.reset_mock()
                 self.api.send_message.reset_mock()
                 await bot.setup(self.update(GLOBAL_ADMIN_ID, text="/setup"), self.context)
                 self.assertEqual(self.store.state["chat_id"], GROUP_ID)
+                self.assertIn(str(GROUP_ID), bot.subscribed_groups())
+                if linked is not None:
+                    self.assertIn(str(linked), bot.subscribed_groups())
                 self.store.start_new_round_today.assert_not_called()
                 self.store.ensure_assignment_through.assert_called_with(DAY)
                 self.assert_mentions(self.api.send_message.await_args, ["@alice_one"])

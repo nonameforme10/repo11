@@ -163,7 +163,11 @@ def upsert_state(key: str, value) -> None:
     if value is None:
         cur.execute("DELETE FROM bot_state WHERE key = %s", (key,))
         return
-    if isinstance(value, list):
+    if key == "group_subscriptions":
+        if not isinstance(value, dict):
+            raise ValueError("group_subscriptions must be a dictionary.")
+        value = json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+    elif isinstance(value, list):
         value = ",".join(str(v) for v in value)
     elif isinstance(value, bool):
         value = "true" if value else "false"
@@ -176,6 +180,11 @@ def upsert_state(key: str, value) -> None:
 
 
 raw_state = read_json(Path("data/state.json")) or read_json(Path("state.json")) or {}
+
+# Group targets and their individual delivery markers survive backup restoration.
+# Older imports without this key leave existing subscriptions unchanged.
+if "group_subscriptions" in raw_state:
+    upsert_state("group_subscriptions", raw_state["group_subscriptions"])
 
 if "round_order" in raw_state:
     # New-format state (UUID-based round_order list)

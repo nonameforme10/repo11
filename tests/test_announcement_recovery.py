@@ -41,8 +41,8 @@ class AnnouncementRecoveryTests(unittest.IsolatedAsyncioTestCase):
             callback_data=f"ui:reset_yes:{DAY}:7",
         )
 
-    def assert_group_delivery(self, call):
-        self.assertEqual(call.kwargs["chat_id"], GROUP_ID)
+    def assert_group_delivery(self, call, group_id=GROUP_ID):
+        self.assertEqual(call.kwargs["chat_id"], group_id)
         self.assert_mentions(call, ["@alice_one"])
         self.assertIsNone(call.kwargs.get("reply_markup"))
 
@@ -244,26 +244,24 @@ class AnnouncementRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.state["last_message_id"], 505)
         self.store.save_state.assert_called_once()
 
-    async def test_group_switch_while_sending_keeps_new_group_pending(self):
+    async def test_group_join_while_sending_keeps_new_group_pending(self):
         new_group_id = GROUP_ID - 20
         send_count = 0
 
-        async def send_and_switch_group(**kwargs):
+        async def send_and_add_group(**kwargs):
             nonlocal send_count
             send_count += 1
             if send_count == 1:
-                self.store.state["chat_id"] = new_group_id
-                self.store.state["last_announced_date"] = None
-                self.store.state["last_message_id"] = None
+                bot.remember_group(Chat(id=new_group_id, type=Chat.SUPERGROUP))
             return SimpleNamespace(message_id=505 + send_count)
 
-        self.api.send_message.side_effect = send_and_switch_group
+        self.api.send_message.side_effect = send_and_add_group
         with patch.object(bot, "date_at_eight_or_later", return_value=True):
             self.assertTrue(await bot.publish_today_if_due(self.context.application))
-            self.assertEqual(self.store.state["chat_id"], new_group_id)
-            self.assertIsNone(self.store.state["last_announced_date"])
-            self.assertIsNone(self.store.state["last_message_id"])
-            self.store.save_state.assert_not_called()
+            self.assertEqual(self.store.state["chat_id"], GROUP_ID)
+            subscriptions = bot.subscribed_groups()
+            self.assertEqual(subscriptions[str(GROUP_ID)]["last_announced_date"], DAY.isoformat())
+            self.assertIsNone(subscriptions[str(new_group_id)]["last_announced_date"])
 
             self.assertTrue(await bot.publish_today_if_due(self.context.application))
             self.assertFalse(await bot.publish_today_if_due(self.context.application))
@@ -274,10 +272,9 @@ class AnnouncementRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second.kwargs["chat_id"], new_group_id)
         self.assert_mentions(second, ["@alice_one"])
         self.assertEqual(self.store.state["last_announced_date"], DAY.isoformat())
-        self.assertEqual(self.store.state["last_message_id"], 507)
-        self.store.save_state.assert_called_once()
+        self.assertEqual(bot.subscribed_groups()[str(new_group_id)]["last_message_id"], 507)
 
-    async def test_failed_setup_in_new_group_clears_old_delivery_flag_and_can_retry(self):
+    async def test_failed_setup_in_new_group_preserves_old_delivery_and_retries_new_group(self):
         new_group_id = GROUP_ID - 10
         self.store.state["last_announced_date"] = DAY.isoformat()
         self.store.state["last_message_id"] = 111
@@ -287,8 +284,10 @@ class AnnouncementRecoveryTests(unittest.IsolatedAsyncioTestCase):
             await bot.setup(self.update(ADMIN_ID, text="/setup", chat_id=new_group_id), self.context)
 
         self.assertEqual(self.store.state["chat_id"], new_group_id)
-        self.assertIsNone(self.store.state["last_announced_date"])
-        self.assertIsNone(self.store.state["last_message_id"])
+        subscriptions = bot.subscribed_groups()
+        self.assertEqual(subscriptions[str(GROUP_ID)]["last_announced_date"], DAY.isoformat())
+        self.assertEqual(subscriptions[str(GROUP_ID)]["last_message_id"], 111)
+        self.assertIsNone(subscriptions[str(new_group_id)]["last_announced_date"])
         self.api.send_message.side_effect = None
         self.api.send_message.reset_mock()
         with patch.object(bot, "date_at_eight_or_later", return_value=True):
@@ -297,7 +296,7 @@ class AnnouncementRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.api.send_message.assert_awaited_once()
         self.assertEqual(self.api.send_message.await_args.kwargs["chat_id"], new_group_id)
         self.assert_mentions(self.api.send_message.await_args, ["@alice_one"])
-        self.assertEqual(self.store.state["last_announced_date"], DAY.isoformat())
+        self.assertEqual(bot.subscribed_groups()[str(new_group_id)]["last_announced_date"], DAY.isoformat())
 
     async def test_admin_elon_forces_group_announcement_despite_delivered_flag(self):
         self.store.state["last_announced_date"] = DAY.isoformat()
@@ -325,6 +324,160 @@ class AnnouncementRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.api.send_message.await_args.kwargs["chat_id"], fixtures.REGULAR_USER_ID)
         self.assertEqual(self.store.state, before_state)
         self.store.save_state.assert_not_called()
+
+    async def test_all_subscribed_groups_get_one_independent_announcement(self):
+        other_group_id = GROUP_ID - 10
+        bot.remember_group(Chat(id=other_group_id, type=Chat.SUPERGROUP))
+        with patch.object(bot, "date_at_eight_or_later", return_value=True):
+            self.assertTrue(await bot.publish_today_if_due(self.context.application))
+            self.assertFalse(await bot.publish_today_if_due(self.context.application))
+        calls = self.api.send_message.await_args_list
+        self.assertEqual({call.kwargs["chat_id"] for call in calls}, {GROUP_ID, other_group_id})
+        self.assertEqual(len(calls), 2)
+        for call in calls:
+            self.assert_group_delivery(call, call.kwargs["chat_id"])
+        for record in bot.subscribed_groups().values():
+            self.assertEqual(record["last_announced_date"], DAY.isoformat())
+            self.assertEqual(record["last_announced_round_number"], 7)
+            self.assertEqual(record["last_announced_member_id"], "alice")
+
+    async def test_failed_primary_does_not_block_secondary_or_repeat_success_after_restart(self):
+        other_group_id = GROUP_ID - 10
+        bot.remember_group(Chat(id=other_group_id, type=Chat.SUPERGROUP))
+        fail_primary = True
+
+        async def deliver_independently(**kwargs):
+            if kwargs["chat_id"] == GROUP_ID and fail_primary:
+                raise TelegramError("primary group offline")
+            return SimpleNamespace(message_id=601 if kwargs["chat_id"] == GROUP_ID else 602)
+
+        self.api.send_message.side_effect = deliver_independently
+        with patch.object(bot, "date_at_eight_or_later", return_value=True):
+            with self.assertLogs("navbatchilik", level="ERROR"):
+                self.assertTrue(await bot.publish_today_if_due(self.context.application))
+            subscriptions = bot.subscribed_groups()
+            self.assertIsNone(subscriptions[str(GROUP_ID)]["last_announced_date"])
+            self.assertEqual(subscriptions[str(other_group_id)]["last_announced_date"], DAY.isoformat())
+            self.context.application.bot_data = {}
+            fail_primary = False
+            self.assertTrue(await bot.publish_today_if_due(self.context.application))
+            self.assertFalse(await bot.publish_today_if_due(self.context.application))
+        self.assertEqual([call.kwargs["chat_id"] for call in self.api.send_message.await_args_list],
+                         [GROUP_ID, other_group_id, GROUP_ID])
+        self.assertEqual(bot.subscribed_groups()[str(GROUP_ID)]["last_message_id"], 601)
+        self.assertEqual(bot.subscribed_groups()[str(other_group_id)]["last_message_id"], 602)
+
+    async def test_round_reset_during_first_group_send_never_sends_stale_round_to_second_group(self):
+        other_group_id = GROUP_ID - 10
+        bot.remember_group(Chat(id=other_group_id, type=Chat.SUPERGROUP))
+        first_send = True
+
+        async def reset_during_send(**kwargs):
+            nonlocal first_send
+            if first_send:
+                first_send = False
+                self.store.start_new_round_today(DAY)
+            return SimpleNamespace(message_id=603)
+
+        self.api.send_message.side_effect = reset_during_send
+        with patch.object(bot, "date_at_eight_or_later", return_value=True):
+            self.assertTrue(await bot.publish_today_if_due(self.context.application))
+            self.api.send_message.assert_awaited_once()
+            for record in bot.subscribed_groups().values():
+                self.assertIsNone(record["last_announced_date"])
+            self.assertTrue(await bot.publish_today_if_due(self.context.application))
+            self.assertFalse(await bot.publish_today_if_due(self.context.application))
+        calls = self.api.send_message.await_args_list
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(calls[0].kwargs["chat_id"], GROUP_ID)
+        self.assertIn("Davra: 7", calls[0].kwargs["text"])
+        for call in calls[1:]:
+            self.assertIn("Davra: 8", call.kwargs["text"])
+        self.assertEqual({call.kwargs["chat_id"] for call in calls[1:]}, {GROUP_ID, other_group_id})
+        self.assertTrue(all(record["last_announced_round_number"] == 8 for record in bot.subscribed_groups().values()))
+
+    async def test_group_removal_during_send_does_not_restore_subscription_or_block_others(self):
+        other_group_id = GROUP_ID - 10
+        bot.remember_group(Chat(id=other_group_id, type=Chat.SUPERGROUP))
+
+        async def remove_primary_during_send(**kwargs):
+            if kwargs["chat_id"] == GROUP_ID:
+                bot.forget_group(GROUP_ID)
+            return SimpleNamespace(message_id=604)
+
+        self.api.send_message.side_effect = remove_primary_during_send
+        with patch.object(bot, "date_at_eight_or_later", return_value=True):
+            self.assertTrue(await bot.publish_today_if_due(self.context.application))
+            self.assertFalse(await bot.publish_today_if_due(self.context.application))
+        self.assertEqual(set(bot.subscribed_groups()), {str(other_group_id)})
+        self.assertEqual(bot.subscribed_groups()[str(other_group_id)]["last_announced_date"], DAY.isoformat())
+        self.assertEqual(self.api.send_message.await_count, 2)
+
+    async def test_group_remove_and_rejoin_during_send_leaves_new_subscription_pending(self):
+        bot.remember_group(Chat(id=GROUP_ID, type=Chat.SUPERGROUP, title="Group"))
+        original_id = bot.subscribed_groups()[str(GROUP_ID)]["subscription_id"]
+        first_send = True
+
+        async def rejoin_during_send(**kwargs):
+            nonlocal first_send
+            if first_send:
+                first_send = False
+                bot.forget_group(GROUP_ID)
+                bot.remember_group(Chat(id=GROUP_ID, type=Chat.SUPERGROUP, title="Group"))
+            return SimpleNamespace(message_id=605)
+
+        self.api.send_message.side_effect = rejoin_during_send
+        with patch.object(bot, "date_at_eight_or_later", return_value=True):
+            self.assertTrue(await bot.publish_today_if_due(self.context.application))
+            record = bot.subscribed_groups()[str(GROUP_ID)]
+            self.assertNotEqual(record["subscription_id"], original_id)
+            self.assertIsNone(record["last_announced_date"])
+            self.assertTrue(await bot.publish_today_if_due(self.context.application))
+            self.assertFalse(await bot.publish_today_if_due(self.context.application))
+        self.assertEqual(self.api.send_message.await_count, 2)
+
+    async def test_group_elon_targets_current_group_and_private_elon_targets_all(self):
+        other_group_id = GROUP_ID - 10
+        bot.remember_group(Chat(id=other_group_id, type=Chat.SUPERGROUP))
+        with patch.object(bot, "date_at_eight_or_later", return_value=True):
+            await bot.elon(self.update(ADMIN_ID, text="/elon", chat_id=other_group_id), self.context)
+            group_calls = [call for call in self.api.send_message.await_args_list
+                           if "BUGUNGI NAVBATCHI" in call.kwargs["text"]]
+            self.assertEqual([call.kwargs["chat_id"] for call in group_calls], [other_group_id])
+            self.api.send_message.reset_mock()
+            await bot.elon(self.update(ADMIN_ID, text="/elon", chat_id=ADMIN_ID, chat_type=Chat.PRIVATE), self.context)
+            group_calls = [call for call in self.api.send_message.await_args_list
+                           if "BUGUNGI NAVBATCHI" in call.kwargs["text"]]
+            self.assertEqual({call.kwargs["chat_id"] for call in group_calls}, {GROUP_ID, other_group_id})
+
+    async def test_setup_response_during_reset_does_not_mark_new_round_delivered(self):
+        self.store.state["group_subscriptions"] = bot.subscribed_groups()
+        async def reset_during_setup_response(**kwargs):
+            self.store.start_new_round_today(DAY)
+            return SimpleNamespace(message_id=606)
+
+        self.api.send_message.side_effect = reset_during_setup_response
+        await bot.setup(self.update(ADMIN_ID, text="/setup"), self.context)
+        self.assertEqual(self.store.state["round_number"], 8)
+        self.assertIsNone(bot.subscribed_groups()[str(GROUP_ID)]["last_announced_date"])
+        self.assertNotEqual(bot.subscribed_groups()[str(GROUP_ID)].get("last_announced_round_number"), 8)
+        self.api.send_message.side_effect = None
+        self.api.send_message.reset_mock()
+        with patch.object(bot, "date_at_eight_or_later", return_value=True):
+            self.assertTrue(await bot.publish_today_if_due(self.context.application))
+        self.api.send_message.assert_awaited_once()
+        self.assertIn("Davra: 8", self.api.send_message.await_args.kwargs["text"])
+
+    async def test_setup_response_after_group_removal_does_not_restore_subscription(self):
+        async def remove_during_setup_response(**kwargs):
+            bot.forget_group(GROUP_ID)
+            return SimpleNamespace(message_id=607)
+
+        self.api.send_message.side_effect = remove_during_setup_response
+        await bot.setup(self.update(ADMIN_ID, text="/setup"), self.context)
+        self.assertEqual(bot.subscribed_groups(), {})
+        self.assertEqual(self.store.state["chat_id"], GROUP_ID)
+        self.assertIsNone(self.store.state["last_announced_date"])
 
 
 if __name__ == "__main__":

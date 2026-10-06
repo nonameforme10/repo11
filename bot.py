@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 from telegram import (
     BotCommand, BotCommandScopeAllChatAdministrators, BotCommandScopeAllGroupChats,
     BotCommandScopeAllPrivateChats, BotCommandScopeChat, BotCommandScopeChatMember,
-    BotCommandScopeDefault, ForceReply, InlineKeyboardButton, InlineKeyboardMarkup,
+    BotCommandScopeDefault, Chat, ForceReply, InlineKeyboardButton, InlineKeyboardMarkup,
     MenuButtonCommands, MessageEntity, ReplyKeyboardMarkup, Update,
 )
 from telegram.constants import ChatMemberStatus, ChatType
@@ -105,7 +105,7 @@ async def require_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> b
     user_id = update.effective_user.id if update.effective_user else "noma'lum"
     await send_plain(
         update, context,
-        "Bu bo'lim faqat bot adminlari va ulangan guruh adminlari uchun.\n"
+        "Bu bo'lim faqat bot adminlari va asosiy guruh adminlari uchun.\n"
         f"Sizning Telegram ID: {user_id}. Bot egasi bu ID'ni ADMIN_IDS ga qo'shishi mumkin.",
     )
     return False
@@ -163,49 +163,110 @@ def ensure_today() -> None:
     STORE.ensure_assignment_through(today())
 
 
+def subscribed_groups() -> dict[str, dict]:
+    raw = STORE.state.get("group_subscriptions")
+    if isinstance(raw, dict):
+        return {str(key): dict(value) for key, value in raw.items()
+                if re.fullmatch(r"-[1-9]\d*", str(key)) and isinstance(value, dict)}
+    linked = STORE.state.get("chat_id")
+    try:
+        linked = int(linked)
+    except (TypeError, ValueError):
+        return {}
+    if linked >= 0:
+        return {}
+    return {str(linked): {
+        "title": "", "subscription_id": "legacy",
+        "last_announced_date": STORE.state.get("last_announced_date"),
+        "last_message_id": STORE.state.get("last_message_id"),
+        "last_announced_round_number": STORE.state.get("round_number"),
+        "last_announced_member_id": STORE.state.get("today_duty_id"),
+    }}
+
+
 def remember_group(chat) -> bool:
-    """Use the first real group; changing an existing group uses /setup."""
+    """Subscribe every group Telegram tells the bot about, preserving its rotation."""
     if chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
         return False
-    linked = STORE.state.get("chat_id")
-    if linked is not None and int(linked) < 0:
+    groups = subscribed_groups()
+    key = str(chat.id)
+    added = key not in groups
+    title = chat.title or ""
+    if not added and (not title or groups[key].get("title") == title):
         return False
-    STORE.state["last_announced_date"] = None
-    STORE.state["last_message_id"] = None
-    STORE.state["chat_id"] = chat.id
+    if added:
+        groups[key] = {"title": title, "subscription_id": secrets.token_hex(8),
+                       "last_announced_date": None, "last_message_id": None,
+                       "last_announced_round_number": None, "last_announced_member_id": None}
+    else:
+        groups[key]["title"] = title
+    STORE.state["group_subscriptions"] = groups
+    primary = STORE.state.get("chat_id")
+    try:
+        valid_primary = primary is not None and int(primary) < 0
+    except (TypeError, ValueError):
+        valid_primary = False
+    if not valid_primary:
+        STORE.state["chat_id"] = chat.id
+        STORE.state["last_announced_date"] = None
+        STORE.state["last_message_id"] = None
     STORE.save_state()
-    return True
+    log.info("Guruh avtomatik ulandi: chat_id=%s, title=%s", chat.id, title)
+    return added
+
+
+def forget_group(chat_id: int) -> None:
+    groups = subscribed_groups()
+    if str(chat_id) not in groups:
+        return
+    del groups[str(chat_id)]
+    STORE.state["group_subscriptions"] = groups
+    if STORE.state.get("chat_id") == chat_id:
+        # Keep the configured management group; discovery must not grant another group's admins access.
+        STORE.state["last_announced_date"] = None
+        STORE.state["last_message_id"] = None
+    STORE.save_state()
 
 
 async def on_membership_change(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     change = update.my_chat_member
     member = change.new_chat_member
-    if member.status in {ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR}:
+    active = member.status in {ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR}
+    active = active or (member.status == ChatMemberStatus.RESTRICTED and getattr(member, "is_member", False))
+    if active:
         remember_group(change.chat)
         if change.chat.type in {ChatType.GROUP, ChatType.SUPERGROUP}:
             await register_group_commands(context.application, change.chat.id)
-    elif (
-        member.status in {ChatMemberStatus.LEFT, ChatMemberStatus.BANNED}
-        and change.chat.id == STORE.state.get("chat_id")
-    ):
-        STORE.state["last_announced_date"] = None
-        STORE.state["last_message_id"] = None
-        STORE.state["chat_id"] = None
-        STORE.save_state()
+    elif member.status in {ChatMemberStatus.LEFT, ChatMemberStatus.BANNED, ChatMemberStatus.RESTRICTED}:
+        forget_group(change.chat.id)
 
 
 async def on_group_migration(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
-    linked = STORE.state.get("chat_id")
-    if message.migrate_to_chat_id and linked == message.chat_id:
-        STORE.state["chat_id"] = message.migrate_to_chat_id
-    elif message.migrate_from_chat_id and linked == message.migrate_from_chat_id:
-        STORE.state["chat_id"] = message.chat_id
+    if message.migrate_to_chat_id:
+        old_id, new_id = message.chat_id, message.migrate_to_chat_id
+    elif message.migrate_from_chat_id:
+        old_id, new_id = message.migrate_from_chat_id, message.chat_id
     else:
         return
-    STORE.state["last_message_id"] = None
+    groups = subscribed_groups()
+    if str(old_id) not in groups:
+        if STORE.state.get("chat_id") == old_id:
+            STORE.state["chat_id"] = new_id
+            STORE.state["last_message_id"] = None
+            STORE.save_state()
+        remember_group(Chat(id=new_id, type=ChatType.SUPERGROUP, title=message.chat.title))
+        await register_group_commands(context.application, new_id)
+        return
+    record = groups.pop(str(old_id))
+    record["last_message_id"] = None
+    groups[str(new_id)] = record
+    STORE.state["group_subscriptions"] = groups
+    if STORE.state.get("chat_id") == old_id:
+        STORE.state["chat_id"] = new_id
+        STORE.state["last_message_id"] = None
     STORE.save_state()
-    await register_group_commands(context.application, STORE.state["chat_id"])
+    await register_group_commands(context.application, new_id)
 
 
 def current_duty_start() -> date:
@@ -597,53 +658,68 @@ async def notify_admins(app: Application, text: str) -> None:
             log.warning("Admin %s ga xabar yuborilmadi: %s", admin_id, exc)
 
 
-async def publish_today_if_due(app: Application, *, force: bool = False) -> bool:
+async def publish_today_if_due(app: Application, *, force: bool = False, group_id: int | None = None) -> bool:
     lock = app.bot_data.setdefault("announcement_lock", asyncio.Lock())
     async with lock:
         ensure_today()
         if not force and not date_at_eight_or_later():
             return False
         key = today().isoformat()
-        if not force and STORE.state.get("last_announced_date") == key:
+        groups = subscribed_groups()
+        if group_id is not None:
+            groups = {group_key: record for group_key, record in groups.items() if int(group_key) == group_id}
+        if not groups or not STORE.state.get("today_duty_id"):
             return False
-        if not force:
-            start = current_duty_start()
-            block_start = start + timedelta(days=((today() - start).days // DUTY_DAYS) * DUTY_DAYS)
+        start = current_duty_start()
+        block_start = start + timedelta(days=((today() - start).days // DUTY_DAYS) * DUTY_DAYS)
+        assignment = (key, STORE.state.get("round_number"), STORE.state.get("today_duty_id"), start.isoformat())
+        text = duty_message()
+        sent_any = False
+        for group_key, record in groups.items():
+            current_assignment = (today().isoformat(), STORE.state.get("round_number"),
+                                  STORE.state.get("today_duty_id"), current_duty_start().isoformat())
+            if current_assignment != assignment:
+                break
+            active = subscribed_groups().get(group_key)
+            if active is None or active.get("subscription_id") != record.get("subscription_id"):
+                continue
+            if not force:
+                try:
+                    last_announced = date.fromisoformat(active.get("last_announced_date"))
+                except (TypeError, ValueError):
+                    last_announced = None
+                same_duty = (active.get("last_announced_round_number") == assignment[1]
+                             and active.get("last_announced_member_id") == assignment[2])
+                if same_duty and last_announced and block_start <= last_announced <= today():
+                    continue
+            chat_id = int(group_key)
             try:
-                last_announced = date.fromisoformat(STORE.state.get("last_announced_date"))
-            except (TypeError, ValueError):
-                last_announced = None
-            if last_announced and block_start <= last_announced <= today():
-                return False
-        chat_id = STORE.state.get("chat_id")
-        if not chat_id or int(chat_id) >= 0 or not STORE.state.get("today_duty_id"):
-            return False
-        assignment = (chat_id, key, STORE.state.get("round_number"), STORE.state.get("today_duty_id"))
-        try:
-            text = duty_message()
-            sent = await app.bot.send_message(
-                chat_id=chat_id,
-                text=text,
-                parse_mode=None,
-                entities=mention_entities(text),
-                disable_notification=False,
-            )
-        except TelegramError:
-            log.exception("Bugungi navbatchi xabarini yuborib bo'lmadi; keyingi tekshiruvda qayta uriniladi")
-            return False
-        current_assignment = (
-            STORE.state.get("chat_id"), today().isoformat(),
-            STORE.state.get("round_number"), STORE.state.get("today_duty_id"),
-        )
-        if current_assignment != assignment:
-            # A reset or group switch while sending must not mark the new target delivered.
-            log.info("E'lon yuborildi, ammo guruh yoki navbat o'zgardi; yangi e'lon hali kutilmoqda")
-            return True
-        STORE.state["last_announced_date"] = key
-        STORE.state["last_message_id"] = sent.message_id
-        STORE.save_state()
-        log.info("Bugungi e'lon guruhga yuborildi: sana=%s, chat_id=%s, message_id=%s", key, chat_id, sent.message_id)
-        return True
+                sent = await app.bot.send_message(
+                    chat_id=chat_id, text=text, parse_mode=None, entities=mention_entities(text),
+                    disable_notification=False,
+                )
+            except TelegramError:
+                log.exception("Guruhga e'lon yuborilmadi; qayta uriniladi: chat_id=%s", chat_id)
+                continue
+            sent_any = True
+            current_assignment = (today().isoformat(), STORE.state.get("round_number"),
+                                  STORE.state.get("today_duty_id"), current_duty_start().isoformat())
+            if current_assignment != assignment:
+                log.info("E'lon yuborildi, ammo navbat o'zgardi; yangi e'lon hali kutilmoqda")
+                break
+            latest = subscribed_groups()
+            active = latest.get(group_key)
+            if active is None or active.get("subscription_id") != record.get("subscription_id"):
+                continue
+            active.update(last_announced_date=key, last_message_id=sent.message_id,
+                          last_announced_round_number=assignment[1], last_announced_member_id=assignment[2])
+            STORE.state["group_subscriptions"] = latest
+            if STORE.state.get("chat_id") == chat_id:
+                STORE.state["last_announced_date"] = key
+                STORE.state["last_message_id"] = sent.message_id
+            STORE.save_state()
+            log.info("Bugungi e'lon guruhga yuborildi: sana=%s, chat_id=%s, message_id=%s", key, chat_id, sent.message_id)
+        return sent_any
 
 
 async def daily_announcement(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -666,7 +742,6 @@ def bot_commands(admin: bool = False) -> list[BotCommand]:
             ("odamlar", "Odamlarni qo'shish, tahrirlash va o'chirish"),
             ("bajarildi", "Navbatchilikni bajarildi deb belgilash"),
             ("elon", "Bugungi navbatchini guruhga e'lon qilish"),
-            ("setup", "Botni shu guruhga ulash"),
             ("tarix", "Oxirgi 30 kunlik navbatchilik tarixi"),
             ("zaxira", "Ma'lumotlarning zaxira nusxasini olish"),
             ("ism_qosh", "Ism va ixtiyoriy username bilan odam qo'shish"),
@@ -714,10 +789,27 @@ async def _apply_command_menus_locked(app: Application, targets: list) -> None:
 
 async def register_group_commands(app: Application, chat_id: int) -> None:
     targets = [
-        (BotCommandScopeChatMember(chat_id=chat_id, user_id=admin_id), True)
+        (BotCommandScopeChatMember(chat_id=chat_id, user_id=admin_id), False)
         for admin_id in sorted(ADMIN_IDS)
     ]
     await apply_command_menus(app, targets)
+    app.bot_data.setdefault("group_command_menus_refreshed", set()).add(chat_id)
+
+
+async def refresh_group_command_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    if not chat or chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
+        return
+    message = update.effective_message
+    if message and (message.migrate_to_chat_id or message.migrate_from_chat_id):
+        return
+    if message and message.left_chat_member and message.left_chat_member.id == context.bot.id:
+        forget_group(chat.id)
+        return
+    remember_group(chat)
+    refreshed = context.application.bot_data.setdefault("group_command_menus_refreshed", set())
+    if chat.id not in refreshed:
+        await register_group_commands(context.application, chat.id)
 
 
 async def register_bot_commands(app: Application) -> None:
@@ -725,20 +817,21 @@ async def register_bot_commands(app: Application) -> None:
         (BotCommandScopeDefault(), False),
         (BotCommandScopeAllPrivateChats(), False),
         (BotCommandScopeAllGroupChats(), False),
-        (BotCommandScopeAllChatAdministrators(), True),
+        (BotCommandScopeAllChatAdministrators(), False),
     ]
     targets.extend((BotCommandScopeChat(chat_id=admin_id), True) for admin_id in sorted(ADMIN_IDS))
-    chat_id = STORE.state.get("chat_id")
-    if chat_id and int(chat_id) < 0:
-        targets.extend(
-            (BotCommandScopeChatMember(chat_id=int(chat_id), user_id=admin_id), True)
-            for admin_id in sorted(ADMIN_IDS)
-        )
+    targets.extend(
+        (BotCommandScopeChatMember(chat_id=int(chat_id), user_id=admin_id), False)
+        for chat_id in subscribed_groups() for admin_id in sorted(ADMIN_IDS)
+    )
     targets.append((None, False))
     await apply_command_menus(app, targets)
 
 
 async def post_init(app: Application) -> None:
+    if STORE.state.get("group_subscriptions") is None:
+        STORE.state["group_subscriptions"] = subscribed_groups()
+        STORE.save_state()
     await register_bot_commands(app)
     ensure_today()
     current = display_person(current_person())
@@ -807,12 +900,16 @@ async def setup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if not await require_admin(update, context):
         return
-    already_linked = STORE.state.get("chat_id") == chat.id
+    already_linked = str(chat.id) in subscribed_groups()
+    remember_group(chat)
+    record = subscribed_groups()[str(chat.id)]
     STORE.state["chat_id"] = chat.id
-    if not already_linked:
-        STORE.state["last_announced_date"] = None
-        STORE.state["last_message_id"] = None
+    STORE.state["last_announced_date"] = record.get("last_announced_date")
+    STORE.state["last_message_id"] = record.get("last_message_id")
     ensure_today()
+    assignment = (today().isoformat(), STORE.state.get("round_number"), STORE.state.get("today_duty_id"),
+                  current_duty_start().isoformat())
+    subscription_id = subscribed_groups()[str(chat.id)].get("subscription_id")
     heading = "✅ Guruh allaqachon ulangan. Joriy davra davom etadi." if already_linked else "✅ Guruh ulandi."
     text = heading + "\n\n" + duty_message()
     sent = await context.bot.send_message(
@@ -822,9 +919,18 @@ async def setup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         entities=mention_entities(text),
         reply_markup=admin_keyboard(),
     )
-    STORE.state["last_announced_date"] = today().isoformat()
-    STORE.state["last_message_id"] = sent.message_id
-    STORE.save_state()
+    groups = subscribed_groups()
+    active = groups.get(str(chat.id))
+    current_assignment = (today().isoformat(), STORE.state.get("round_number"), STORE.state.get("today_duty_id"),
+                          current_duty_start().isoformat())
+    if active and active.get("subscription_id") == subscription_id and current_assignment == assignment:
+        active.update(last_announced_date=assignment[0], last_message_id=sent.message_id,
+                      last_announced_round_number=assignment[1], last_announced_member_id=assignment[2])
+        STORE.state["group_subscriptions"] = groups
+        if STORE.state.get("chat_id") == chat.id:
+            STORE.state["last_announced_date"] = assignment[0]
+            STORE.state["last_message_id"] = sent.message_id
+        STORE.save_state()
     await register_group_commands(context.application, chat.id)
 
 
@@ -874,8 +980,9 @@ async def bekor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def elon(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await require_admin(update, context):
         return
-    if await publish_today_if_due(context.application, force=True):
-        text = "✅ Bugungi navbatchi guruhga teg bilan e'lon qilindi."
+    target = update.effective_chat.id if update.effective_chat.type in {ChatType.GROUP, ChatType.SUPERGROUP} else None
+    if await publish_today_if_due(context.application, force=True, group_id=target):
+        text = "✅ Bugungi navbatchi e'lon qilindi."
     else:
         text = "⚠️ E'lon yuborilmadi. /setup bilan guruhni ulang va botning guruhda xabar yuborish huquqini tekshiring."
     await send_plain(update, context, text)
@@ -920,7 +1027,7 @@ async def zaxira(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             for k in (
                 "chat_id", "round_order", "round_position", "round_number",
                 "last_member_id", "last_assigned_date", "last_announced_date",
-                "today_duty_id", "today_duty_date", "today_duty_done", "duty_started_date",
+                "today_duty_id", "today_duty_date", "today_duty_done", "duty_started_date", "group_subscriptions",
             )
         },
         "history.json": {
@@ -1182,6 +1289,9 @@ def main() -> None:
         raise RuntimeError("ADMIN_IDS topilmadi. .env faylga admin Telegram ID'larini kiriting.")
 
     app = Application.builder().token(TOKEN).post_init(post_init).build()
+    app.add_handler(
+        MessageHandler(filters.ChatType.GROUPS, refresh_group_command_menu), group=-1,
+    )
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("setup", setup))
     app.add_handler(CommandHandler("bugun", bugun))

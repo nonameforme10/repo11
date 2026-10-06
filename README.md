@@ -98,13 +98,16 @@ pm2 restart navbatchilik-bot
 ## 6. Admin buyruqlari
 
 Bot ishga tushganda Telegramdagi buyruqlar menyusi avtomatik sozlanadi.
-Guruhda yoki shaxsiy chatda `/` yozilsa, `/start`, `/bugun` va `/jadval`
-tavsiya qilinadi. Guruh adminlari va `ADMIN_IDS` dagi bot adminlari
-boshqaruv buyruqlarini ham ko'radi; shaxsiy chatdagi **Menu** tugmasi ham
-buyruqlar ro'yxatini ochadi. Eski `/royxat` va `/cancel` buyruqlari ishlashda
-davom etadi, ammo tavsiya ro'yxatida ko'rsatilmaydi.
+Guruhda `/` yozilsa, barcha a'zolar, jumladan guruh adminlari va `ADMIN_IDS`
+dagi bot adminlari uchun faqat `/start`, `/bugun` va `/jadval` tavsiya qilinadi.
+Boshqaruv buyruqlari `ADMIN_IDS` dagi adminlarga botning shaxsiy chatida
+ko'rsatiladi; shaxsiy chatdagi **Menu** tugmasi shu buyruqlar ro'yxatini ochadi.
+Oddiy foydalanuvchining shaxsiy chatida ham faqat uchta asosiy buyruq bor.
+`/setup` faqat guruhda qo'lda yoziladi va tavsiya ro'yxatiga kiritilmaydi.
+Eski `/royxat` va `/cancel` buyruqlari ishlashda davom etadi, ammo tavsiya
+ro'yxatida ko'rsatilmaydi.
 
-- `/setup` — guruhni ulash (bot admini, guruhda); qayta yuborish joriy davrani saqlaydi
+- `/setup` — asosiy boshqaruv guruhini tanlash (bot admini, guruhda); barcha guruh obunalari va joriy davra saqlanadi
 - `/bugun` — bugungi navbatchi
 - `/jadval` — navbatchilik boshlanish sanalari va kelgusi navbatchilar
 - `/royxat` — barcha a'zolar va davra holati
@@ -114,7 +117,7 @@ davom etadi, ammo tavsiya ro'yxatida ko'rsatilmaydi.
 - `/ism_ochir 3` — `/royxat` dagi raqam bo'yicha o'chirish
 - `/zaxira` — DB snapshot (names + state + history) ni shaxsiy chatga yuborish
 - `/admin` — admin paneli va tasdiqlash bilan yangi davra boshlash
-- `/elon` — bugungi navbatchini ulangan guruhga teg bilan hozir yuborish (qayta yuborish ham mumkin)
+- `/elon` — bugungi navbatchini teg bilan hozir e'lon qilish: guruhdan yuborilsa shu guruhga, shaxsiy chatdan yuborilsa barcha obuna guruhlarga
 - `/odamlar` — odamlarni inline tugmalar orqali qo'shish, ismini tahrirlash va o'chirish
 - `/bekor` yoki `/cancel` — ism kiritish so'rovini bekor qilish
 
@@ -149,17 +152,23 @@ ikki kunlik davrning boshlangan sanasi saqlanadi. Yangi davra oxirgi a'zo
 kamida ikki kun navbatchi bo'lib, bajarildi deb belgilangandan keyin boshlanadi.
 
 Oddiy guruhda `/bugun` va `/jadval` faqat matnli navbatchilik xabarini yuboradi;
-bu buyruqlar va avtomatik e'londa menyu yoki tugmalar chiqmaydi. Bot guruhga qo'shilganda yoki birinchi marta
-shu buyruqlardan biri yuborilganda guruh avtomatik ulanadi. Agar oldindan boshqa
-guruh ulangan bo'lsa, bot admini `/setup` bilan yangi guruhni tanlaydi. Guruhni
-ulash ro'yxat va joriy davrani o'zgartirmaydi.
+bu buyruqlar va avtomatik e'londa menyu yoki tugmalar chiqmaydi. Bot qo'shilgan
+har bir guruh avtomatik obuna bo'ladi. Guruhdan xabar kelganda ham obuna
+tekshiriladi; avval ulangan guruhlar saqlanadi. `/setup` talab qilinmaydi.
+Bot guruhdan chiqarilsa faqat shu guruhning obunasi o'chadi. Guruh superguruhga
+aylansa, obuna va yetkazilgan e'lon holati yangi Telegram ID'ga ko'chadi.
+Barcha guruhlar bir xil odamlar ro'yxati va navbatchilik jadvalidan foydalanadi.
+Guruh qo'shish yoki olib tashlash ro'yxat va joriy davrani o'zgartirmaydi.
 
-`.env` dagi `ADMIN_IDS` bot adminlarini belgilaydi. Ulangan guruhning egasi va
-Telegram adminlari ham shu guruh ichida botni boshqara oladi. Ularning huquqi
-har bir so'rovda Telegram orqali tekshiriladi; bot guruhda admin bo'lishi kerak.
-Guruhni boshqa guruhga ko'chirish uchun `ADMIN_IDS` dagi bot admini `/setup`
-yuborishi kerak. Shaxsiy chatda guruh admini bo'lishning o'zi
-yetarli emas — `ADMIN_IDS` talab qilinadi.
+`.env` dagi `ADMIN_IDS` bot adminlarini belgilaydi. Birinchi ulangan guruh asosiy
+boshqaruv guruhi bo'ladi; `ADMIN_IDS` dagi bot admini `/setup` orqali boshqa
+asosiy guruhni tanlashi mumkin. Bu tanlov barcha guruhlarning e'lon obunalarini
+saqlaydi. Bot asosiy guruhdan chiqarilsa, qolgan guruhlarga e'lon davom etadi;
+boshqaruv uchun tanlangan guruh o'z-o'zidan almashtirilmaydi. Asosiy guruhning egasi va Telegram adminlari shu guruh ichida umumiy
+ro'yxatni boshqara oladi. Ularning huquqi har bir so'rovda Telegram orqali
+tekshiriladi; bot guruhda admin bo'lishi kerak. Qo'shimcha obuna guruhlarda
+umumiy ro'yxatni boshqarish uchun `ADMIN_IDS` talab qilinadi. Shaxsiy chatdagi
+boshqaruv ham `ADMIN_IDS` dagi adminlar uchun mavjud.
 
 Username'lar haqiqiy Telegram mention entity'lari bilan yuboriladi. Ismda emoji
 bo'lsa ham tegning joylashuvi to'g'ri hisoblanadi. Username yo'q a'zolar ism bilan
@@ -193,8 +202,11 @@ yuborilgan e'lonni yetkazadi. Yetkazilgan e'lon o'sha ikki kunlik davr ichida
 yana avtomatik yuborilmaydi.
 Yetkazilgan sana faqat guruhga xabar muvaffaqiyatli yuborilgandan keyin saqlanadi;
 shaxsiy admin panelida yangi davra boshlash e'lonni yuborilgan deb belgilamaydi.
-Parallel tekshiruvlar bir xil e'lonni takrorlamaydi. Admin `/elon` bilan
-navbatchini istalgan kuni, jumladan ikkinchi kuni ham hozir e'lon qilishi mumkin.
+Har bir guruhning yetkazilgan e'lon sanasi alohida saqlanadi. Bir guruhga
+yuborish xatosi qolgan guruhlarga xabar yuborishni to'xtatmaydi; keyingi
+tekshiruv faqat e'loni yetkazilmagan guruhlarga qayta urinadi. Parallel
+tekshiruvlar bir xil e'lonni takrorlamaydi. Admin `/elon` bilan navbatchini
+istalgan kuni, jumladan ikkinchi kuni ham hozir e'lon qilishi mumkin.
 
 E'londa username oddiy havola emas, haqiqiy `@username` mention entity sifatida
 yuboriladi va bot xabarni ovozsiz yuborishni so'ramaydi. Username to'g'ri bo'lishi
@@ -214,6 +226,9 @@ Ikki kunlik navbatchilikning boshlanish sanasi `bot_state` ichidagi
 `duty_started_date` kalitida saqlanadi; jadvallar sxemasini o'zgartirish
 talab qilinmaydi. Eski bazada bu kalit bo'lmasa, bot mavjud navbatchilik
 sanasini boshlanish sanasi sifatida oladi va oldingi tarixni o'zgartirmaydi.
+Guruh obunalari va ularning alohida e'lon holatlari `bot_state` ichidagi
+`group_subscriptions` JSON qiymatida saqlanadi. Eski bazaning `chat_id` va
+yetkazilgan e'lon holati birinchi ishga tushishda shu ro'yxatga o'tkaziladi.
 
 ---
 
@@ -223,4 +238,5 @@ sanasini boshlanish sanasi sifatida oladi va oldingi tarixni o'zgartirmaydi.
 2. `python3 migrate_to_pg.py` bilan mavjud ma'lumotlarni import qiling.
 3. `pm2 start ecosystem.config.js` bilan botni ishga tushiring.
 4. `pm2 logs navbatchilik-bot` orqali qayta ishga tushish xabari va xatolarni tekshiring.
-5. Guruhda `/setup` yozing, so'ng `/bugun`, `/jadval`, `/royxat`, `/tarix` ni sinab ko'ring.
+5. Botni ikki guruhga qo'shing va har ikkisida `/bugun` hamda `/jadval` ni sinab ko'ring; `/` ro'yxatida faqat `/start`, `/bugun` va `/jadval` borligini tekshiring. Asosiy boshqaruv guruhini tanlash uchun shu guruhda `/setup` yuboring.
+6. `ADMIN_IDS` dagi admin sifatida botning shaxsiy chatida `/start` yuboring va **Menu** orqali `/admin`, `/odamlar` va boshqa boshqaruv buyruqlarini tekshiring; `/setup` bu ro'yxatda bo'lmaydi.
