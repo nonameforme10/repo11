@@ -59,6 +59,7 @@ class FakeStore:
             "round_number": 7,
             "today_duty_id": "alice",
             "today_duty_date": DAY.isoformat(),
+            "duty_started_date": DAY.isoformat(),
             "today_duty_done": False,
             "last_announced_date": None,
             "last_message_id": None,
@@ -499,7 +500,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
     async def test_member_lookup_command_tags_member_and_removes_request(self):
         await bot.on_text(self.update(text="/bob_two", chat_id=REGULAR_USER_ID, chat_type=Chat.PRIVATE), self.context)
         self.assert_mentions(self.api.send_message.await_args, ["@bob_two"])
-        self.assertIn("06.10.2026", self.api.send_message.await_args.kwargs["text"])
+        self.assertIn("07.10.2026", self.api.send_message.await_args.kwargs["text"])
         self.api.delete_message.assert_awaited_once()
 
     async def test_known_command_is_not_handled_a_second_time_by_text_handler(self):

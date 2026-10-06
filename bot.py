@@ -22,7 +22,7 @@ from telegram.ext import (
     filters,
 )
 
-from data_store import PostgresStore
+from data_store import DUTY_DAYS, PostgresStore
 
 try:
     from dotenv import load_dotenv
@@ -199,6 +199,19 @@ async def on_group_migration(update: Update, context: ContextTypes.DEFAULT_TYPE)
     STORE.save_state()
 
 
+def current_duty_start() -> date:
+    value = STORE.state.get("duty_started_date") or STORE.state.get("today_duty_date")
+    try:
+        return min(date.fromisoformat(value), today())
+    except (TypeError, ValueError):
+        return today()
+
+
+def duty_period_text(start: date, end: date | None = None) -> str:
+    end = end or start + timedelta(days=DUTY_DAYS - 1)
+    return f"{start.strftime('%d.%m.%Y')} – {end.strftime('%d.%m.%Y')}"
+
+
 def duty_message() -> str:
     ensure_today()
     person = current_person()
@@ -211,16 +224,19 @@ def duty_message() -> str:
         day_text = duty_date
     lines = [
         "🧹 BUGUNGI NAVBATCHI",
-        f"Davra: {STORE.state.get('round_number', 1)} · {STORE.state.get('round_position', 0)}-kun",
+        f"Davra: {STORE.state.get('round_number', 1)} · {STORE.state.get('round_position', 0)}-navbat",
         "",
         f"👤 {person['name']}",
         f"📅 {day_text}",
+        f"🗓 Navbatchilik muddati: {duty_period_text(current_duty_start())}",
     ]
     handle = mention(person)
     if handle:
         lines.extend(["", f"👉 {handle}"])
     if STORE.state.get("today_duty_done"):
         lines.extend(["", "✅ Bajarildi deb belgilangan."])
+    elif today() >= current_duty_start() + timedelta(days=DUTY_DAYS):
+        lines.extend(["", "⏳ Ikki kunlik muddat tugagan. Bajarildi deb belgilanguncha navbatchi shu odam bo'lib qoladi."])
     return "\n".join(lines)
 
 
@@ -229,34 +245,37 @@ def scheduled_members() -> list[tuple[date, dict | None]]:
     state = STORE.state
     result: list[tuple[date, dict | None]] = []
     current_date = state.get("today_duty_date")
+    next_day = today()
     if current_date == today().isoformat() and state.get("today_duty_id"):
         result.append((today(), current_person()))
+        next_day = max(today() + timedelta(days=1), current_duty_start() + timedelta(days=DUTY_DAYS))
     position = int(state.get("round_position", 0))
-    next_day = today() + timedelta(days=1)
     for member_id in state.get("round_order", [])[position:]:
         result.append((next_day, member_by_id(member_id)))
-        next_day += timedelta(days=1)
+        next_day += timedelta(days=DUTY_DAYS)
     return result
 
 
 def schedule_text() -> str:
     entries = scheduled_members()
     if not entries:
-        return "✅ Joriy davrada qolgan navbatchi yo'q. Yangi davra navbatdagi kuni boshlanadi."
-    lines = ["🗓 NAVBATCHILIK JADVALI", f"Davra: {STORE.state.get('round_number', 1)}"]
+        return "✅ Joriy davrada qolgan navbatchi yo'q. Yangi davra joriy ikki kunlik navbat tugagach boshlanadi."
+    lines = ["🗓 NAVBATCHILIK JADVALI", f"Davra: {STORE.state.get('round_number', 1)} · Har bir odamga {DUTY_DAYS} kun"]
     for number, (day, person) in enumerate(entries, 1):
         if day == today():
-            heading = f"🔔 BUGUN · {day.strftime('%d.%m.%Y')}"
+            start = current_duty_start()
+            end = max(today(), start + timedelta(days=DUTY_DAYS - 1))
+            heading = f"🔔 BUGUN · {duty_period_text(start, end)}"
         elif day == today() + timedelta(days=1):
-            heading = f"📅 ERTAGA · {day.strftime('%d.%m.%Y')}"
+            heading = f"📅 ERTAGA · {duty_period_text(day)}"
         else:
-            heading = f"📅 {day.strftime('%d.%m.%Y')}"
+            heading = f"📅 {duty_period_text(day)}"
         lines.append(f"{number}. {heading}\n   👤 {display_person(person)}")
     if STORE.state.get("today_duty_id") and not STORE.state.get("today_duty_done"):
         lines.extend([
             "",
-            "⏳ Bugungi navbatchilik bajarildi deb belgilanmasa, shu navbatchi ertaga ham qoladi "
-            "va keyingi sanalar bir kunga suriladi.",
+            "⏳ Ikki kunlik navbatchilik bajarildi deb belgilanmasa, shu navbatchi muddatdan keyin ham qoladi "
+            "va keyingi sanalar har bir qo'shimcha kun uchun bir kunga suriladi.",
         ])
     if STORE.state.get("round_position", 0) >= len(STORE.state.get("round_order", [])):
         lines.extend(["", "🔀 Davra tugagach, keyingi davra yangi tartibda boshlanadi."])
@@ -271,7 +290,7 @@ def roster_text() -> str:
     current_id = state.get("today_duty_id") if state.get("today_duty_date") == today().isoformat() else None
     lines = [
         f"📋 ISMLAR VA NAVBAT TARTIBI · {len(STORE.names)} kishi",
-        f"Davra: {state.get('round_number', 1)} · Bugungi navbatchi davraning {state.get('round_position', 0)}-kuni",
+        f"Davra: {state.get('round_number', 1)} · Bugungi navbatchi davraning {state.get('round_position', 0)}-navbati",
         "",
     ]
     for number, person in enumerate(STORE.names, 1):
@@ -586,6 +605,15 @@ async def publish_today_if_due(app: Application, *, force: bool = False) -> bool
         key = today().isoformat()
         if not force and STORE.state.get("last_announced_date") == key:
             return False
+        if not force:
+            start = current_duty_start()
+            block_start = start + timedelta(days=((today() - start).days // DUTY_DAYS) * DUTY_DAYS)
+            try:
+                last_announced = date.fromisoformat(STORE.state.get("last_announced_date"))
+            except (TypeError, ValueError):
+                last_announced = None
+            if last_announced and block_start <= last_announced <= today():
+                return False
         chat_id = STORE.state.get("chat_id")
         if not chat_id or int(chat_id) >= 0 or not STORE.state.get("today_duty_id"):
             return False
@@ -666,7 +694,7 @@ async def send_plain(update: Update, context: ContextTypes.DEFAULT_TYPE, text: s
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat.type in {ChatType.GROUP, ChatType.SUPERGROUP}:
         remember_group(update.effective_chat)
-        await send_plain(update, context, "🧹 /bugun — bugungi navbatchi\n🗓 /jadval — navbatchilik jadvali\nHar kuni 08:00 da bugungi navbatchi yuboriladi.")
+        await send_plain(update, context, "🧹 /bugun — bugungi navbatchi\n🗓 /jadval — navbatchilik jadvali\nHar bir odamga 2 kun. E'lon navbat boshida Toshkent vaqti bilan 08:00 da yuboriladi.")
         return
     await send_plain(
         update,
@@ -799,7 +827,7 @@ async def zaxira(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             for k in (
                 "chat_id", "round_order", "round_position", "round_number",
                 "last_member_id", "last_assigned_date", "last_announced_date",
-                "today_duty_id", "today_duty_date", "today_duty_done",
+                "today_duty_id", "today_duty_date", "today_duty_done", "duty_started_date",
             )
         },
         "history.json": {
@@ -917,11 +945,11 @@ async def member_lookup_response(
         return
     day, place = duty
     if day == today():
-        result = f"🔔 {display_person(person)} — bugungi navbatchi."
+        result = f"🔔 {display_person(person)} — bugungi navbatchi.\n🗓 Navbatchilik muddati: {duty_period_text(current_duty_start())}"
     else:
         delta = (day - today()).days
         when = "ertaga" if delta == 1 else f"{delta} kundan keyin"
-        result = f"👤 {display_person(person)}\n📅 Navbati: {day.strftime('%d.%m.%Y')} ({when})\nOldida {place} kishi bor."
+        result = f"👤 {display_person(person)}\n📅 Navbati: {duty_period_text(day)} ({when})\nOldida {place} kishi bor."
     await context.bot.send_message(chat_id=message.chat_id, text=result, parse_mode=None, entities=mention_entities(result))
 
 

@@ -193,6 +193,7 @@ if "round_order" in raw_state:
     upsert_state("last_announced_date", raw_state.get("last_announced_date"))
     upsert_state("today_duty_id", raw_state.get("today_duty_id"))
     upsert_state("today_duty_date", raw_state.get("today_duty_date"))
+    upsert_state("duty_started_date", raw_state.get("duty_started_date") or raw_state.get("today_duty_date"))
     upsert_state("today_duty_done", raw_state.get("today_duty_done", False))
 
 else:
@@ -221,6 +222,7 @@ else:
     upsert_state("round_position", pos)
     upsert_state("round_number", 1)
     upsert_state("last_assigned_date", duty_start)
+    upsert_state("duty_started_date", duty_start)
     if duty_start and order_ids and pos < len(order_ids):
         upsert_state("today_duty_id", order_ids[pos])
         upsert_state("today_duty_date", duty_start)

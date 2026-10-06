@@ -99,7 +99,7 @@ pm2 restart navbatchilik-bot
 
 - `/setup` — guruhni ulash (bot admini, guruhda); qayta yuborish joriy davrani saqlaydi
 - `/bugun` — bugungi navbatchi
-- `/jadval` — kelgusi navbatchilar
+- `/jadval` — ikki kunlik navbatchilik davrlari va kelgusi navbatchilar
 - `/royxat` — barcha a'zolar va davra holati
 - `/tarix` — oxirgi 30 kunlik tarix
 - `/bajarildi` — bugungi vazifani bajarilgan deb belgilash
@@ -122,17 +122,23 @@ va navbatdagi o'rni saqlanadi; o'tgan kunlar tarixidagi ismlar o'zgarmaydi.
 Guruhda botning ism so'ragan xabariga javob bering; oddiy guruh xabarlari ism
 sifatida saqlanmaydi. Ro'yxat 10 kishidan sahifalanadi.
 
-Admin bugungi navbatchilikni `/bajarildi` yoki **✅ Bajarildi** tugmasi bilan
-tasdiqlamaguncha, shu a'zo ertasi kuni ham navbatchi bo'lib qoladi. Navbatdagi
-a'zolarning sanalari har bir bajarilmagan kun uchun bir kunga suriladi.
-Masalan, Azim 12-oktabrda bajarildi deb belgilanmasa, 13-oktabrda ham Azim
-navbatchi bo'ladi; Bahromning navbati 14-oktabrga suriladi. Azim 13-oktabrda
-bajarildi deb belgilangach, 14-oktabrda Bahrom navbatchi bo'ladi. Bot bir necha
-kun ishlamasa ham bajarilmagan navbatchilik saqlanadi; davra oxirgi a'zo
-bajarildi deb belgilangandan keyingina avtomatik yangilanadi.
+Har bir a'zo **ikki kun** navbatchi bo'ladi. Masalan, Azimning navbati
+1–2-oktabr, Bahromniki 3–4-oktabr, keyingi a'zoniki 5–6-oktabr bo'ladi.
+Admin `/bajarildi` yoki **✅ Bajarildi** tugmasi bilan tasdiqlasa ham, birinchi
+kun tugashi bilan navbat o'tmaydi: Azim 1-oktabrda bajarildi deb belgilansa,
+2-oktabrda ham Azim qoladi, Bahrom 3-oktabrda boshlaydi. Tasdiqlash ikkinchi
+kuni ham saqlanadi; uni qayta bosish shart emas.
+
+Ikki kun tugaganida navbatchilik hali bajarildi deb belgilanmagan bo'lsa,
+shu a'zo navbatchi bo'lib qoladi va kelgusi navbatlar suriladi. Masalan,
+Azim 1–2-oktabrdan keyin ham tasdiqlanmasa, 3-oktabrda ham Azim qoladi.
+Azim 3-oktabrda bajarildi deb belgilansa, Bahrom 4–5-oktabrda navbatchi
+bo'ladi. Bot bir necha kun ishlamasa ham bajarilmagan navbatchilik va
+ikki kunlik davrning boshlangan sanasi saqlanadi. Yangi davra oxirgi a'zo
+kamida ikki kun navbatchi bo'lib, bajarildi deb belgilangandan keyin boshlanadi.
 
 Oddiy guruhda `/bugun` va `/jadval` faqat matnli navbatchilik xabarini yuboradi;
-bu buyruqlar va kundalik e'londa menyu yoki tugmalar chiqmaydi. Bot guruhga qo'shilganda yoki birinchi marta
+bu buyruqlar va avtomatik e'londa menyu yoki tugmalar chiqmaydi. Bot guruhga qo'shilganda yoki birinchi marta
 shu buyruqlardan biri yuborilganda guruh avtomatik ulanadi. Agar oldindan boshqa
 guruh ulangan bo'lsa, bot admini `/setup` bilan yangi guruhni tanlaydi. Guruhni
 ulash ro'yxat va joriy davrani o'zgartirmaydi.
@@ -158,14 +164,26 @@ xabarida ko'rinadi; eski davra uchun tasdiqlash tugmasi qayta ishlatilmaydi.
 
 ## 7. E'lonlar jadvali
 
-Bot har kuni **Toshkent vaqti bilan 08:00** da guruhga bugungi navbatchi haqida xabar yuboradi.
-Shu maqsadda `python-telegram-bot` ning `job_queue.run_daily` funksiyasi ishlatiladi — vaqt zona bilan (tzinfo=Asia/Tashkent) berilgan.
-Bot har 60 soniyada yuborilmagan e'lonni ham tekshiradi: 08:00 dagi urinish
-muvaffaqiyatsiz bo'lsa yoki bot/guruh keyinroq ulansa, e'lon qayta yuboriladi.
+Bot ikki kunlik navbatchilikning birinchi kuni **Toshkent vaqti bilan 08:00**
+da guruhga e'lon yuboradi. Navbatlar o'z vaqtida bajarilsa, e'lonlar
+1-oktabr, 3-oktabr, 5-oktabr kabi ikki kun oralig'ida chiqadi. Birinchi kuni
+e'lon yetkazilgan bo'lsa, ikkinchi kuni takrorlanmaydi. Bajarilmagan
+navbatchilik cho'zilsa, shu a'zo haqida uning boshlanish sanasidan hisoblab
+har ikki kunlik davrda eslatma yuboriladi. Kech tasdiqlash navbatdagi a'zoning
+boshlanish sanasini surishi mumkin; yangi navbatchilikning e'loni shu sanaga
+bog'liq bo'ladi.
+
+`job_queue.run_daily` har kuni 08:00 da tekshiradi, ammo faqat e'lon kuni
+xabar yuboradi; vaqt zonasi `Asia/Tashkent`. Bot har 60 soniyada yuborilmagan
+e'lonni ham tekshiradi: e'lon kunidagi 08:00 urinish muvaffaqiyatsiz bo'lsa
+yoki bot/guruh keyinroq ulansa, qayta uriniladi. Bot birinchi kuni ishlamagan
+bo'lsa, shu ikki kunlik davrning ikkinchi kuni 08:00 dan keyin o'tkazib
+yuborilgan e'lonni yetkazadi. Yetkazilgan e'lon o'sha ikki kunlik davr ichida
+yana avtomatik yuborilmaydi.
 Yetkazilgan sana faqat guruhga xabar muvaffaqiyatli yuborilgandan keyin saqlanadi;
 shaxsiy admin panelida yangi davra boshlash e'lonni yuborilgan deb belgilamaydi.
-Parallel tekshiruvlar bir xil e'lonni takrorlamaydi. Oldingi xato sabab bugungi
-e'lon yuborilmagan bo'lsa, admin `/elon` bilan uni hozir yuborishi mumkin.
+Parallel tekshiruvlar bir xil e'lonni takrorlamaydi. Admin `/elon` bilan
+navbatchini istalgan kuni, jumladan ikkinchi kuni ham hozir e'lon qilishi mumkin.
 
 E'londa username oddiy havola emas, haqiqiy `@username` mention entity sifatida
 yuboriladi va bot xabarni ovozsiz yuborishni so'ramaydi. Username to'g'ri bo'lishi
@@ -180,6 +198,11 @@ kerak; bildirishnoma chiqishi a'zoning Telegram va telefon sozlamalariga ham bog
 | `members` | A'zolar ro'yxati (id, name, username) |
 | `bot_state` | Davra holati (key-value) |
 | `duty_history` | Kunlik navbatchilar tarixi |
+
+Ikki kunlik navbatchilikning boshlanish sanasi `bot_state` ichidagi
+`duty_started_date` kalitida saqlanadi; jadvallar sxemasini o'zgartirish
+talab qilinmaydi. Eski bazada bu kalit bo'lmasa, bot mavjud navbatchilik
+sanasini boshlanish sanasi sifatida oladi va oldingi tarixni o'zgartirmaydi.
 
 ---
 

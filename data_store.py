@@ -17,6 +17,7 @@ from psycopg2.extensions import connection as PgConnection
 
 log = logging.getLogger(__name__)
 TZ = ZoneInfo("Asia/Tashkent")
+DUTY_DAYS = 2
 
 # Fallback list used only when no JSON files exist at all on first run.
 DEFAULT_NAMES = [
@@ -304,11 +305,13 @@ class PostgresStore:
         state_last = self._get_state_key("last_assigned_date")
         if state_last and newest <= state_last:
             return
+        started = self._restored_duty_start(row["member_id"], row["duty_date"], row["round_number"])
         self._set_state_key("round_order", ",".join(row["round_order"]))
         self._set_state_key("round_position", str(row["round_day"]))
         self._set_state_key("round_number", str(row["round_number"]))
         self._set_state_key("today_duty_id", row["member_id"])
         self._set_state_key("today_duty_date", newest)
+        self._set_state_key("duty_started_date", started.isoformat() if started else None)
         self._set_state_key("today_duty_done", "true" if row["done"] else "false")
         self._set_state_key("last_member_id", row["member_id"])
         self._set_state_key("last_assigned_date", newest)
@@ -335,6 +338,36 @@ class PostgresStore:
     # ------------------------------------------------------------------
     # Public API (mirrors JsonStore)
     # ------------------------------------------------------------------
+
+    def duty_started_on(self) -> date | None:
+        """Return the active turn's start, adopting a legacy assignment date if needed."""
+        if not self._get_state_key("today_duty_id"):
+            return None
+        assignment_date = None
+        try:
+            assignment_date = date.fromisoformat(self._get_state_key("today_duty_date") or "")
+        except (TypeError, ValueError):
+            pass
+        try:
+            started = date.fromisoformat(self._get_state_key("duty_started_date") or "")
+        except (TypeError, ValueError):
+            return assignment_date
+        if assignment_date is not None and started > assignment_date:
+            return assignment_date
+        return started
+
+    def _restored_duty_start(self, member_id: str | None, day: date, round_number: int) -> date | None:
+        """Reuse a start only when restored history belongs to the same active turn."""
+        if member_id is None:
+            return None
+        if (
+            member_id == self._get_state_key("today_duty_id")
+            and str(round_number) == str(self._get_state_key("round_number"))
+        ):
+            started = self.duty_started_on()
+            if started is not None and started <= day:
+                return started
+        return day
 
     def member(self, member_id: str | None) -> dict[str, str] | None:
         if member_id is None:
@@ -397,11 +430,13 @@ class PostgresStore:
                 existing = cur.fetchone()
             if existing:
                 order = list(existing["round_order"])
+                started = self._restored_duty_start(existing["member_id"], day, existing["round_number"])
                 self._set_state_key("round_order", ",".join(order))
                 self._set_state_key("round_position", str(existing["round_day"]))
                 self._set_state_key("round_number", str(existing["round_number"]))
                 self._set_state_key("today_duty_id", existing["member_id"])
                 self._set_state_key("today_duty_date", key)
+                self._set_state_key("duty_started_date", started.isoformat() if started else None)
                 self._set_state_key("today_duty_done", "true" if existing["done"] else "false")
                 self._set_state_key("last_member_id", existing["member_id"])
                 self._set_state_key("last_assigned_date", key)
@@ -411,6 +446,7 @@ class PostgresStore:
         if not names:
             self._set_state_key("today_duty_id", None)
             self._set_state_key("today_duty_date", key)
+            self._set_state_key("duty_started_date", None)
             self._set_state_key("today_duty_done", "false")
             self._set_state_key("last_assigned_date", key)
             order_str = self._get_state_key("round_order", "")
@@ -439,17 +475,19 @@ class PostgresStore:
         position = int(self._get_state_key("round_position", "0") or "0")
         previous_id = self._get_state_key("today_duty_id")
         previous_date = self._get_state_key("today_duty_date")
+        started = self.duty_started_on()
+        previous_done = self._get_state_key("today_duty_done", "false") == "true"
         carry_over = (
             not overwrite
             and previous_date is not None
             and previous_date < key
-            and self._get_state_key("today_duty_done", "false") != "true"
+            and (not previous_done or (started is not None and day < started + timedelta(days=DUTY_DAYS)))
             and any(person["id"] == previous_id for person in names)
         )
         if carry_over:
-            # The cursor already points past this person. Keep the queue waiting
-            # until an admin confirms completion, even at the end of a round.
+            # One cursor step covers the entire two-day turn, including overdue duty.
             member_id = previous_id
+            done = previous_done
         else:
             if not order or position >= len(order):
                 self._start_round()
@@ -458,6 +496,8 @@ class PostgresStore:
                 position = 0
             member_id = order[position]
             position += 1
+            started = day
+            done = False
         round_number = int(self._get_state_key("round_number", "1") or "1")
         snapshot = self.member_snapshot(member_id)
 
@@ -483,7 +523,7 @@ class PostgresStore:
                     round_number,
                     position,
                     order,
-                    False,
+                    done,
                 ),
             )
         self._set_state_key("round_position", str(position))
@@ -491,9 +531,15 @@ class PostgresStore:
         self._set_state_key("last_assigned_date", key)
         self._set_state_key("today_duty_id", member_id)
         self._set_state_key("today_duty_date", key)
-        self._set_state_key("today_duty_done", "false")
+        self._set_state_key("duty_started_date", started.isoformat() if started else key)
+        self._set_state_key("today_duty_done", "true" if done else "false")
 
     def ensure_assignment_through(self, target: date) -> None:
+        # Legacy deployments adopt the stored assignment date once without rewriting history.
+        started = self.duty_started_on()
+        if started is not None and self._get_state_key("duty_started_date") != started.isoformat():
+            with self._conn:
+                self._set_state_key("duty_started_date", started.isoformat())
         last_text = self._get_state_key("last_assigned_date")
         if not last_text:
             self._assign_day(target)
@@ -520,6 +566,7 @@ class PostgresStore:
             self._set_state_key("last_announced_date", None)
             self._set_state_key("today_duty_id", None)
             self._set_state_key("today_duty_date", None)
+            self._set_state_key("duty_started_date", None)
             self._set_state_key("today_duty_done", "false")
             self._assign_day_in_transaction(today, overwrite=True)
 

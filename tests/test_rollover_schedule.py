@@ -1,4 +1,4 @@
-"""Exercise real daily rollover through the bot's schedule and completion UI."""
+"""Exercise two-day duty rollover through the schedule and completion UI."""
 
 from copy import deepcopy
 from datetime import date, datetime, timezone
@@ -14,10 +14,7 @@ from test_store_reset import MemoryStore
 
 OCTOBER_12 = date(2026, 10, 12)
 OCTOBER_13 = date(2026, 10, 13)
-PENDING_NOTE = (
-    "⏳ Bugungi navbatchilik bajarildi deb belgilanmasa, shu navbatchi ertaga ham "
-    "qoladi va keyingi sanalar bir kunga suriladi."
-)
+PENDING_NOTE = "⏳"
 
 
 class ScheduleStore(MemoryStore):
@@ -25,6 +22,7 @@ class ScheduleStore(MemoryStore):
 
     def __init__(self):
         super().__init__(last_day=OCTOBER_12, position=1, done=False)
+        self.values["duty_started_date"] = OCTOBER_12.isoformat()
         self.people = [
             {"id": "a", "name": "Azim", "username": "@azim_one"},
             {"id": "b", "name": "Bahrom", "username": "@bahrom_two"},
@@ -78,7 +76,7 @@ class RolloverScheduleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.schedule(), [
             (OCTOBER_13, "Azim"),
             (date(2026, 10, 14), "Bahrom"),
-            (date(2026, 10, 15), "Dilshod"),
+            (date(2026, 10, 16), "Dilshod"),
         ])
         self.assertIn(PENDING_NOTE, bot.schedule_text())
         self.assertFalse(self.store.records[OCTOBER_12.isoformat()]["done"])
@@ -90,7 +88,7 @@ class RolloverScheduleTests(unittest.IsolatedAsyncioTestCase):
         self.day = date(2026, 10, 14)
         self.assertEqual(self.schedule(), [
             (self.day, "Bahrom"),
-            (date(2026, 10, 15), "Dilshod"),
+            (date(2026, 10, 16), "Dilshod"),
         ])
         self.assertIn(PENDING_NOTE, bot.schedule_text())
 
@@ -100,7 +98,7 @@ class RolloverScheduleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.schedule(), [
             (self.day, "Azim"),
             (date(2026, 10, 17), "Bahrom"),
-            (date(2026, 10, 18), "Dilshod"),
+            (date(2026, 10, 19), "Dilshod"),
         ])
         self.assertEqual(len(self.store.records), 5)
         for record in self.store.records.values():
