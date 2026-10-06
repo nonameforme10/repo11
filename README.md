@@ -98,15 +98,15 @@ pm2 restart navbatchilik-bot
 ## 6. Admin buyruqlari
 
 Bot ishga tushganda Telegramdagi buyruqlar menyusi avtomatik sozlanadi.
-Guruhda yoki shaxsiy chatda `/` yozilsa, `/start`, `/bugun`, `/jadval` va
-`/id` tavsiya qilinadi. Guruh adminlari va `ADMIN_IDS` dagi bot adminlari
+Guruhda yoki shaxsiy chatda `/` yozilsa, `/start`, `/bugun` va `/jadval`
+tavsiya qilinadi. Guruh adminlari va `ADMIN_IDS` dagi bot adminlari
 boshqaruv buyruqlarini ham ko'radi; shaxsiy chatdagi **Menu** tugmasi ham
 buyruqlar ro'yxatini ochadi. Eski `/royxat` va `/cancel` buyruqlari ishlashda
 davom etadi, ammo tavsiya ro'yxatida ko'rsatilmaydi.
 
 - `/setup` — guruhni ulash (bot admini, guruhda); qayta yuborish joriy davrani saqlaydi
 - `/bugun` — bugungi navbatchi
-- `/jadval` — ikki kunlik navbatchilik davrlari va kelgusi navbatchilar
+- `/jadval` — navbatchilik boshlanish sanalari va kelgusi navbatchilar
 - `/royxat` — barcha a'zolar va davra holati
 - `/tarix` — oxirgi 30 kunlik tarix
 - `/bajarildi` — bugungi vazifani bajarilgan deb belgilash
@@ -117,7 +117,6 @@ davom etadi, ammo tavsiya ro'yxatida ko'rsatilmaydi.
 - `/elon` — bugungi navbatchini ulangan guruhga teg bilan hozir yuborish (qayta yuborish ham mumkin)
 - `/odamlar` — odamlarni inline tugmalar orqali qo'shish, ismini tahrirlash va o'chirish
 - `/bekor` yoki `/cancel` — ism kiritish so'rovini bekor qilish
-- `/id` — o'z Telegram ID'ingizni ko'rish
 
 Admin panelidagi **👥 Odamlarni boshqarish** tugmasi odamlar ro'yxatini ochadi.
 Ro'yxat ostida **➕ Odam qo'shish**, **✏️ Tahrirlash** va **🗑 O'chirish**
@@ -130,17 +129,22 @@ Guruhda botning ism so'ragan xabariga javob bering; oddiy guruh xabarlari ism
 sifatida saqlanmaydi. Ro'yxat 10 kishidan sahifalanadi.
 
 Har bir a'zo **ikki kun** navbatchi bo'ladi. Masalan, Azimning navbati
-1–2-oktabr, Bahromniki 3–4-oktabr, keyingi a'zoniki 5–6-oktabr bo'ladi.
+6-oktabrda, Bahromniki 8-oktabrda, keyingi a'zoniki 10-oktabrda boshlanadi.
+Jadval, bugungi navbatchi xabari va odam kartochkasida **faqat boshlanish
+sanasi** ko'rsatiladi: `06.10.2026`, `08.10.2026`, `10.10.2026`. Sana oralig'i
+yoki tugash sanasi yozilmaydi. Ikkinchi kuni ham shu navbatning boshlanish
+sanasi saqlanadi: 7-oktabrda Azim uchun `06.10.2026` ko'rinadi.
 Admin `/bajarildi` yoki **✅ Bajarildi** tugmasi bilan tasdiqlasa ham, birinchi
-kun tugashi bilan navbat o'tmaydi: Azim 1-oktabrda bajarildi deb belgilansa,
-2-oktabrda ham Azim qoladi, Bahrom 3-oktabrda boshlaydi. Tasdiqlash ikkinchi
+kun tugashi bilan navbat o'tmaydi: Azim 6-oktabrda bajarildi deb belgilansa,
+7-oktabrda ham Azim qoladi, Bahrom 8-oktabrda boshlaydi. Tasdiqlash ikkinchi
 kuni ham saqlanadi; uni qayta bosish shart emas.
 
 Ikki kun tugaganida navbatchilik hali bajarildi deb belgilanmagan bo'lsa,
 shu a'zo navbatchi bo'lib qoladi va kelgusi navbatlar suriladi. Masalan,
-Azim 1–2-oktabrdan keyin ham tasdiqlanmasa, 3-oktabrda ham Azim qoladi.
-Azim 3-oktabrda bajarildi deb belgilansa, Bahrom 4–5-oktabrda navbatchi
-bo'ladi. Bot bir necha kun ishlamasa ham bajarilmagan navbatchilik va
+Azim ikki kundan keyin ham tasdiqlanmasa, 8-oktabrda ham Azim qoladi va
+uning boshlanish sanasi `06.10.2026` bo'lib qoladi. Azim 8-oktabrda bajarildi
+deb belgilansa, Bahrom 9-oktabrda navbatchilikni boshlaydi. Bot bir necha kun
+ishlamasa ham bajarilmagan navbatchilik va
 ikki kunlik davrning boshlangan sanasi saqlanadi. Yangi davra oxirgi a'zo
 kamida ikki kun navbatchi bo'lib, bajarildi deb belgilangandan keyin boshlanadi.
 
@@ -173,7 +177,7 @@ xabarida ko'rinadi; eski davra uchun tasdiqlash tugmasi qayta ishlatilmaydi.
 
 Bot ikki kunlik navbatchilikning birinchi kuni **Toshkent vaqti bilan 08:00**
 da guruhga e'lon yuboradi. Navbatlar o'z vaqtida bajarilsa, e'lonlar
-1-oktabr, 3-oktabr, 5-oktabr kabi ikki kun oralig'ida chiqadi. Birinchi kuni
+6-oktabr, 8-oktabr, 10-oktabr kabi ikki kun oralig'ida chiqadi. Birinchi kuni
 e'lon yetkazilgan bo'lsa, ikkinchi kuni takrorlanmaydi. Bajarilmagan
 navbatchilik cho'zilsa, shu a'zo haqida uning boshlanish sanasidan hisoblab
 har ikki kunlik davrda eslatma yuboriladi. Kech tasdiqlash navbatdagi a'zoning

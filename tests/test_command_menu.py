@@ -23,7 +23,7 @@ import test_bot as fixtures
 
 
 bot = fixtures.bot
-PUBLIC_COMMANDS = {"start", "bugun", "jadval", "id"}
+PUBLIC_COMMANDS = {"start", "bugun", "jadval"}
 MANAGEMENT_COMMANDS = {
     "setup", "admin", "odamlar", "bajarildi", "elon", "tarix", "zaxira",
     "ism_qosh", "ism_ochir", "bekor",
@@ -103,6 +103,7 @@ class CommandMenuTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.api.set_my_commands.await_args_list)
         for call in self.api.set_my_commands.await_args_list:
             commands = call.kwargs.get("commands", call.args[0] if call.args else ())
+            self.assertNotIn("id", self.command_names(call))
             self.assertGreater(len(commands), 0)
             self.assertLessEqual(len(commands), 100)
             self.assertEqual(len(commands), len({command.command for command in commands}))

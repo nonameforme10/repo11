@@ -1,7 +1,8 @@
-"""Two-day duty ranges and announcement recovery using production rollover."""
+"""Two-day rotation with single start-date displays and production rollover."""
 
 from copy import deepcopy
 from datetime import date, timedelta
+import re
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -14,7 +15,7 @@ from test_store_reset import MemoryStore
 
 
 bot = fixtures.bot
-START = date(2026, 10, 1)
+START = date(2026, 10, 6)
 
 
 class TwoDayStore(MemoryStore):
@@ -72,17 +73,17 @@ class TwoDayScheduleTests(unittest.IsolatedAsyncioTestCase):
     def schedule(self):
         return [(day, person["id"]) for day, person in bot.scheduled_members()]
 
-    def assert_dates_in(self, text, *days):
-        for day in days:
-            self.assertIn(day.strftime("%d.%m.%Y"), text)
+    def assert_start_dates(self, text, *days):
+        self.assertEqual(re.findall(r"\b\d{2}\.\d{2}\.\d{4}\b", text),
+                         [day.strftime("%d.%m.%Y") for day in days])
 
-    def test_first_day_lists_two_day_ranges_starting_on_first_third_and_fifth(self):
+    def test_first_day_lists_only_sixth_eighth_and_tenth_start_dates(self):
         self.assertEqual(self.schedule(), [
             (START, "a"), (START + timedelta(days=2), "b"), (START + timedelta(days=4), "c"),
         ])
         text = bot.schedule_text()
-        self.assert_dates_in(text, *(START + timedelta(days=offset) for offset in range(6)))
-        self.assert_dates_in(bot.duty_message(), START, START + timedelta(days=1))
+        self.assert_start_dates(text, *(START + timedelta(days=offset) for offset in (0, 2, 4)))
+        self.assert_start_dates(bot.duty_message(), START)
 
     def test_second_day_keeps_current_lookup_today_and_next_person_tomorrow(self):
         self.day = START + timedelta(days=1)
@@ -92,7 +93,9 @@ class TwoDayScheduleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bot.member_duty("a"), (self.day, 0))
         self.assertEqual(bot.member_duty("b"), (self.day + timedelta(days=1), 1))
         self.assertEqual(bot.current_duty_start(), START)
-        self.assert_dates_in(bot.duty_message(), START, self.day)
+        self.assert_start_dates(bot.duty_message(), START)
+        self.assert_start_dates(bot.schedule_text(), START, START + timedelta(days=2),
+                                START + timedelta(days=4))
         self.assertEqual(self.store.state["round_position"], 1)
 
     def test_completing_first_day_holds_member_through_second_then_advances_on_third(self):
@@ -108,7 +111,7 @@ class TwoDayScheduleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.state["duty_started_date"], self.day.isoformat())
         self.assertEqual(self.store.state["round_position"], 2)
 
-    def test_completed_people_advance_on_the_first_third_and_fifth(self):
+    def test_completed_people_advance_on_the_sixth_eighth_and_tenth(self):
         for offset, member_id in ((0, "a"), (2, "b"), (4, "c")):
             with self.subTest(offset=offset):
                 self.day = START + timedelta(days=offset)
@@ -118,31 +121,33 @@ class TwoDayScheduleTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(self.schedule()[0], (self.day, member_id))
                 self.assertTrue(self.store.state["today_duty_done"])
 
-    def test_unfinished_span_holds_person_and_delays_future_two_day_ranges(self):
+    def test_unfinished_span_keeps_original_start_and_delays_future_start_dates(self):
         self.day = START + timedelta(days=3)
         self.assertEqual(self.schedule(), [
             (self.day, "a"), (START + timedelta(days=4), "b"), (START + timedelta(days=6), "c"),
         ])
         self.assertEqual(self.store.state["duty_started_date"], START.isoformat())
         self.assertIn("⏳", bot.schedule_text())
-        self.assert_dates_in(bot.schedule_text(), START, self.day,
-                             START + timedelta(days=4), START + timedelta(days=5),
-                             START + timedelta(days=6), START + timedelta(days=7))
+        self.assert_start_dates(bot.schedule_text(), START, START + timedelta(days=4),
+                                START + timedelta(days=6))
+        self.assert_start_dates(bot.duty_message(), START)
         self.assertTrue(self.store.mark_today_done(self.day))
         self.day += timedelta(days=1)
         self.assertEqual(self.schedule(), [(self.day, "b"), (START + timedelta(days=6), "c")])
 
-    def test_ranges_cross_a_month_boundary(self):
+    def test_start_dates_cross_a_month_boundary_without_end_dates(self):
         start = date(2026, 1, 31)
         self.store = TwoDayStore(start=start)
         with patch.object(bot, "STORE", self.store):
             self.day = start
             self.assertEqual(self.schedule(), [(start, "a"), (date(2026, 2, 2), "b"), (date(2026, 2, 4), "c")])
-            self.assert_dates_in(bot.duty_message(), start, date(2026, 2, 1))
-            self.assert_dates_in(bot.schedule_text(), start, *(date(2026, 2, number) for number in range(1, 6)))
+            self.assert_start_dates(bot.duty_message(), start)
+            self.assert_start_dates(bot.schedule_text(), start, date(2026, 2, 2), date(2026, 2, 4))
             self.day = date(2026, 2, 1)
             self.assertEqual(bot.member_duty("a"), (self.day, 0))
             self.assertEqual(bot.member_duty("b"), (date(2026, 2, 2), 1))
+            self.assert_start_dates(bot.duty_message(), start)
+            self.assert_start_dates(bot.schedule_text(), start, date(2026, 2, 2), date(2026, 2, 4))
 
     async def test_second_day_member_lookup_still_reports_current_person_as_today(self):
         self.day = START + timedelta(days=1)
@@ -150,15 +155,23 @@ class TwoDayScheduleTests(unittest.IsolatedAsyncioTestCase):
                                      chat_type=Chat.PRIVATE), self.context)
         call = self.api.send_message.await_args
         self.assertIn("bugungi navbatchi", call.kwargs["text"])
+        self.assert_start_dates(call.kwargs["text"], START)
         fixtures.BotTests.assert_mentions(self, call, ["@alice_one"])
 
-    async def test_first_day_announcement_contains_true_mention_and_two_day_period(self):
+    async def test_upcoming_member_lookup_displays_only_its_start_date(self):
+        await bot.on_text(self.update(text="/bob_two", chat_id=fixtures.REGULAR_USER_ID,
+                                     chat_type=Chat.PRIVATE), self.context)
+        call = self.api.send_message.await_args
+        self.assert_start_dates(call.kwargs["text"], START + timedelta(days=2))
+        fixtures.BotTests.assert_mentions(self, call, ["@bob_two"])
+
+    async def test_first_day_announcement_contains_true_mention_and_single_start_date(self):
         self.assertTrue(await bot.publish_today_if_due(self.app))
         call = self.api.send_message.await_args
         self.assertEqual(call.kwargs["chat_id"], fixtures.GROUP_ID)
         self.assertFalse(call.kwargs["disable_notification"])
         fixtures.BotTests.assert_mentions(self, call, ["@alice_one"])
-        self.assert_dates_in(call.kwargs["text"], START, START + timedelta(days=1))
+        self.assert_start_dates(call.kwargs["text"], START)
         self.assertEqual(self.store.state["last_announced_date"], START.isoformat())
 
     async def test_announcements_send_once_per_two_day_block_while_duty_is_unfinished(self):
@@ -178,6 +191,7 @@ class TwoDayScheduleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.state["last_announced_date"], self.day.isoformat())
         self.assertFalse(await bot.publish_today_if_due(self.app))
         self.api.send_message.assert_awaited_once()
+        self.assert_start_dates(self.api.send_message.await_args.kwargs["text"], START)
 
     async def test_first_day_send_failure_recovers_on_second_day(self):
         self.api.send_message.side_effect = [TelegramError("offline send"), SimpleNamespace(message_id=502)]
@@ -188,6 +202,7 @@ class TwoDayScheduleTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await bot.publish_today_if_due(self.app))
         self.assertEqual(self.store.state["last_announced_date"], self.day.isoformat())
         self.assertEqual(self.store.state["last_message_id"], 502)
+        self.assert_start_dates(self.api.send_message.await_args.kwargs["text"], START)
 
     async def test_completed_second_day_is_silent_then_new_person_announced_on_third(self):
         self.assertTrue(await bot.publish_today_if_due(self.app))
@@ -209,6 +224,7 @@ class TwoDayScheduleTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(await bot.publish_today_if_due(self.app))
             self.assertTrue(await bot.publish_today_if_due(self.app, force=True))
         self.api.send_message.assert_awaited_once()
+        self.assert_start_dates(self.api.send_message.await_args.kwargs["text"], START)
         fixtures.BotTests.assert_mentions(self, self.api.send_message.await_args, ["@alice_one"])
 
     async def test_manual_announcement_command_can_send_on_second_day(self):
@@ -221,6 +237,7 @@ class TwoDayScheduleTests(unittest.IsolatedAsyncioTestCase):
         group_calls = [call for call in self.api.send_message.await_args_list
                        if call.kwargs["chat_id"] == fixtures.GROUP_ID]
         self.assertEqual(len(group_calls), 1)
+        self.assert_start_dates(group_calls[0].kwargs["text"], START)
         fixtures.BotTests.assert_mentions(self, group_calls[0], ["@alice_one"])
         self.assertEqual(self.store.state["last_announced_date"], self.day.isoformat())
 

@@ -55,7 +55,7 @@ ANNOUNCE_AT = time(8, 0, tzinfo=TZ)
 STORE = PostgresStore()
 KNOWN_COMMANDS = {
     "start", "setup", "bugun", "jadval", "bajarildi", "admin",
-    "royxat", "tarix", "zaxira", "ism_qosh", "ism_ochir", "id",
+    "royxat", "tarix", "zaxira", "ism_qosh", "ism_ochir",
     "odamlar", "bekor", "cancel", "elon",
 }
 MENTION_PATTERN = re.compile(r"(?<![\w@])@[A-Za-z0-9_]{5,32}(?![\w@-])")
@@ -216,9 +216,8 @@ def current_duty_start() -> date:
         return today()
 
 
-def duty_period_text(start: date, end: date | None = None) -> str:
-    end = end or start + timedelta(days=DUTY_DAYS - 1)
-    return f"{start.strftime('%d.%m.%Y')} – {end.strftime('%d.%m.%Y')}"
+def duty_date_text(day: date) -> str:
+    return day.strftime("%d.%m.%Y")
 
 
 def duty_message() -> str:
@@ -227,17 +226,12 @@ def duty_message() -> str:
     duty_date = STORE.state.get("today_duty_date")
     if not person or not duty_date:
         return "⚠️ Bugungi navbatchi yo'q. Admin /ism_qosh bilan ro'yxatga odam qo'shsin."
-    try:
-        day_text = date.fromisoformat(duty_date).strftime("%d.%m.%Y")
-    except ValueError:
-        day_text = duty_date
     lines = [
         "🧹 BUGUNGI NAVBATCHI",
         f"Davra: {STORE.state.get('round_number', 1)} · {STORE.state.get('round_position', 0)}-navbat",
         "",
         f"👤 {person['name']}",
-        f"📅 {day_text}",
-        f"🗓 Navbatchilik muddati: {duty_period_text(current_duty_start())}",
+        f"📅 {duty_date_text(current_duty_start())}",
     ]
     handle = mention(person)
     if handle:
@@ -272,13 +266,11 @@ def schedule_text() -> str:
     lines = ["🗓 NAVBATCHILIK JADVALI", f"Davra: {STORE.state.get('round_number', 1)} · Har bir odamga {DUTY_DAYS} kun"]
     for number, (day, person) in enumerate(entries, 1):
         if day == today():
-            start = current_duty_start()
-            end = max(today(), start + timedelta(days=DUTY_DAYS - 1))
-            heading = f"🔔 BUGUN · {duty_period_text(start, end)}"
+            heading = f"🔔 BUGUN · {duty_date_text(current_duty_start())}"
         elif day == today() + timedelta(days=1):
-            heading = f"📅 ERTAGA · {duty_period_text(day)}"
+            heading = f"📅 ERTAGA · {duty_date_text(day)}"
         else:
-            heading = f"📅 {duty_period_text(day)}"
+            heading = f"📅 {duty_date_text(day)}"
         lines.append(f"{number}. {heading}\n   👤 {display_person(person)}")
     if STORE.state.get("today_duty_id") and not STORE.state.get("today_duty_done"):
         lines.extend([
@@ -667,7 +659,6 @@ def bot_commands(admin: bool = False) -> list[BotCommand]:
         ("start", "Botni ochish va asosiy menyu"),
         ("bugun", "Bugungi navbatchi"),
         ("jadval", "Ikki kunlik navbatchilik jadvali"),
-        ("id", "Telegram ID'ingizni ko'rish"),
     ]
     if admin:
         commands.extend([
@@ -806,11 +797,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "👋 Navbatchilik botiga xush kelibsiz! Tugmalardan foydalaning:",
         main_keyboard(await can_manage(update, context)),
     )
-
-
-@delete_command_message
-async def show_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await send_plain(update, context, f"Sizning Telegram ID: {update.effective_user.id}")
 
 
 @delete_command_message
@@ -1052,11 +1038,11 @@ async def member_lookup_response(
         return
     day, place = duty
     if day == today():
-        result = f"🔔 {display_person(person)} — bugungi navbatchi.\n🗓 Navbatchilik muddati: {duty_period_text(current_duty_start())}"
+        result = f"🔔 {display_person(person)} — bugungi navbatchi.\n📅 Navbati: {duty_date_text(current_duty_start())}"
     else:
         delta = (day - today()).days
         when = "ertaga" if delta == 1 else f"{delta} kundan keyin"
-        result = f"👤 {display_person(person)}\n📅 Navbati: {duty_period_text(day)} ({when})\nOldida {place} kishi bor."
+        result = f"👤 {display_person(person)}\n📅 Navbati: {duty_date_text(day)} ({when})\nOldida {place} kishi bor."
     await context.bot.send_message(chat_id=message.chat_id, text=result, parse_mode=None, entities=mention_entities(result))
 
 
@@ -1197,7 +1183,6 @@ def main() -> None:
 
     app = Application.builder().token(TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("id", show_id))
     app.add_handler(CommandHandler("setup", setup))
     app.add_handler(CommandHandler("bugun", bugun))
     app.add_handler(CommandHandler("jadval", jadval))

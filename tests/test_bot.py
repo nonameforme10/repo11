@@ -454,12 +454,6 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
                 await bot.ism_ochir(self.update(GROUP_ADMIN_ID), self.context)
                 self.store.remove_name.assert_not_called()
 
-    async def test_id_command_is_available_to_regular_users(self):
-        await bot.show_id(self.update(text="/id", chat_id=REGULAR_USER_ID, chat_type=Chat.PRIVATE), self.context)
-        self.assertIn(str(REGULAR_USER_ID), self.api.send_message.await_args.kwargs["text"])
-        self.api.get_chat_member.assert_not_awaited()
-        self.api.delete_message.assert_awaited_once()
-
     async def test_setup_rejects_private_chat_even_for_configured_admin(self):
         before = dict(self.store.state)
         await bot.setup(self.update(GLOBAL_ADMIN_ID, chat_id=GLOBAL_ADMIN_ID, chat_type=Chat.PRIVATE), self.context)
@@ -506,7 +500,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.api.delete_message.assert_awaited_once()
 
     async def test_known_command_is_not_handled_a_second_time_by_text_handler(self):
-        for text in ("/jadval@DutyBot", "/id"):
+        for text in ("/jadval@DutyBot", "/bugun"):
             await bot.on_text(self.update(text=text), self.context)
         self.api.send_message.assert_not_awaited()
         self.api.delete_message.assert_not_awaited()
