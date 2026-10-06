@@ -102,6 +102,8 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.api.edit_message_text = AsyncMock(return_value=True)
         self.api.edit_message_reply_markup = AsyncMock(return_value=True)
         self.api.get_chat_member = AsyncMock(return_value=ChatMemberMember(self.user(REGULAR_USER_ID)))
+        self.api.set_my_commands = AsyncMock(return_value=True)
+        self.api.set_chat_menu_button = AsyncMock(return_value=True)
         self.context = SimpleNamespace(
             bot=self.api, args=[], application=SimpleNamespace(bot=self.api, bot_data={})
         )

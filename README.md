@@ -97,6 +97,13 @@ pm2 restart navbatchilik-bot
 
 ## 6. Admin buyruqlari
 
+Bot ishga tushganda Telegramdagi buyruqlar menyusi avtomatik sozlanadi.
+Guruhda yoki shaxsiy chatda `/` yozilsa, `/start`, `/bugun`, `/jadval` va
+`/id` tavsiya qilinadi. Guruh adminlari va `ADMIN_IDS` dagi bot adminlari
+boshqaruv buyruqlarini ham ko'radi; shaxsiy chatdagi **Menu** tugmasi ham
+buyruqlar ro'yxatini ochadi. Eski `/royxat` va `/cancel` buyruqlari ishlashda
+davom etadi, ammo tavsiya ro'yxatida ko'rsatilmaydi.
+
 - `/setup` — guruhni ulash (bot admini, guruhda); qayta yuborish joriy davrani saqlaydi
 - `/bugun` — bugungi navbatchi
 - `/jadval` — ikki kunlik navbatchilik davrlari va kelgusi navbatchilar

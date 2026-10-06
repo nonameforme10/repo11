@@ -9,9 +9,14 @@ import secrets
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
-from telegram import ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity, ReplyKeyboardMarkup, Update
+from telegram import (
+    BotCommand, BotCommandScopeAllChatAdministrators, BotCommandScopeAllGroupChats,
+    BotCommandScopeAllPrivateChats, BotCommandScopeChat, BotCommandScopeChatMember,
+    BotCommandScopeDefault, ForceReply, InlineKeyboardButton, InlineKeyboardMarkup,
+    MenuButtonCommands, MessageEntity, ReplyKeyboardMarkup, Update,
+)
 from telegram.constants import ChatMemberStatus, ChatType
-from telegram.error import BadRequest, TelegramError
+from telegram.error import BadRequest, NetworkError, RetryAfter, TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -158,17 +163,18 @@ def ensure_today() -> None:
     STORE.ensure_assignment_through(today())
 
 
-def remember_group(chat) -> None:
+def remember_group(chat) -> bool:
     """Use the first real group; changing an existing group uses /setup."""
     if chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
-        return
+        return False
     linked = STORE.state.get("chat_id")
     if linked is not None and int(linked) < 0:
-        return
+        return False
     STORE.state["last_announced_date"] = None
     STORE.state["last_message_id"] = None
     STORE.state["chat_id"] = chat.id
     STORE.save_state()
+    return True
 
 
 async def on_membership_change(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -176,6 +182,8 @@ async def on_membership_change(update: Update, context: ContextTypes.DEFAULT_TYP
     member = change.new_chat_member
     if member.status in {ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR}:
         remember_group(change.chat)
+        if change.chat.type in {ChatType.GROUP, ChatType.SUPERGROUP}:
+            await register_group_commands(context.application, change.chat.id)
     elif (
         member.status in {ChatMemberStatus.LEFT, ChatMemberStatus.BANNED}
         and change.chat.id == STORE.state.get("chat_id")
@@ -197,6 +205,7 @@ async def on_group_migration(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     STORE.state["last_message_id"] = None
     STORE.save_state()
+    await register_group_commands(context.application, STORE.state["chat_id"])
 
 
 def current_duty_start() -> date:
@@ -646,10 +655,100 @@ async def publish_today_if_due(app: Application, *, force: bool = False) -> bool
 
 
 async def daily_announcement(context: ContextTypes.DEFAULT_TYPE) -> None:
+    pending = context.application.bot_data.get("command_menu_retry")
+    retry_after = context.application.bot_data.get("command_menu_retry_after")
+    if pending and (retry_after is None or now() >= retry_after):
+        await apply_command_menus(context.application, pending)
     await publish_today_if_due(context.application)
 
 
+def bot_commands(admin: bool = False) -> list[BotCommand]:
+    commands = [
+        ("start", "Botni ochish va asosiy menyu"),
+        ("bugun", "Bugungi navbatchi"),
+        ("jadval", "Ikki kunlik navbatchilik jadvali"),
+        ("id", "Telegram ID'ingizni ko'rish"),
+    ]
+    if admin:
+        commands.extend([
+            ("admin", "Admin panelini ochish"),
+            ("odamlar", "Odamlarni qo'shish, tahrirlash va o'chirish"),
+            ("bajarildi", "Navbatchilikni bajarildi deb belgilash"),
+            ("elon", "Bugungi navbatchini guruhga e'lon qilish"),
+            ("setup", "Botni shu guruhga ulash"),
+            ("tarix", "Oxirgi 30 kunlik navbatchilik tarixi"),
+            ("zaxira", "Ma'lumotlarning zaxira nusxasini olish"),
+            ("ism_qosh", "Ism va ixtiyoriy username bilan odam qo'shish"),
+            ("ism_ochir", "Ro'yxatdagi raqam bo'yicha odamni o'chirish"),
+            ("bekor", "Ism kiritish so'rovini bekor qilish"),
+        ])
+    return [BotCommand(command, description) for command, description in commands]
+
+
+async def apply_command_menus(app: Application, targets: list) -> None:
+    lock = app.bot_data.setdefault("command_menu_lock", asyncio.Lock())
+    async with lock:
+        await _apply_command_menus_locked(app, targets)
+
+
+async def _apply_command_menus_locked(app: Application, targets: list) -> None:
+    pending = app.bot_data.get("command_menu_retry", [])
+    blocked_until = app.bot_data.get("command_menu_retry_after")
+    if blocked_until and now() < blocked_until:
+        app.bot_data["command_menu_retry"] = pending + [target for target in targets if target not in pending]
+        return
+    retry = [target for target in app.bot_data.get("command_menu_retry", []) if target not in targets]
+    retry_after = app.bot_data.get("command_menu_retry_after") if retry else None
+    for index, (scope, admin) in enumerate(targets):
+        try:
+            if scope is None:
+                await app.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+            else:
+                await app.bot.set_my_commands(bot_commands(admin), scope=scope)
+        except TelegramError as exc:
+            log.warning("Telegram buyruqlar menyusini sozlab bo'lmadi (%s): %s", scope, exc)
+            if isinstance(exc, RetryAfter) or (isinstance(exc, NetworkError) and not isinstance(exc, BadRequest)):
+                retry.append((scope, admin))
+            if isinstance(exc, RetryAfter):
+                delay = exc.retry_after
+                if not isinstance(delay, timedelta):
+                    delay = timedelta(seconds=delay)
+                deadline = now() + delay
+                retry_after = max(retry_after, deadline) if retry_after else deadline
+                retry.extend(target for target in targets[index + 1:] if target not in retry)
+                break
+    app.bot_data["command_menu_retry"] = retry
+    app.bot_data["command_menu_retry_after"] = retry_after
+
+
+async def register_group_commands(app: Application, chat_id: int) -> None:
+    targets = [
+        (BotCommandScopeChatMember(chat_id=chat_id, user_id=admin_id), True)
+        for admin_id in sorted(ADMIN_IDS)
+    ]
+    await apply_command_menus(app, targets)
+
+
+async def register_bot_commands(app: Application) -> None:
+    targets = [
+        (BotCommandScopeDefault(), False),
+        (BotCommandScopeAllPrivateChats(), False),
+        (BotCommandScopeAllGroupChats(), False),
+        (BotCommandScopeAllChatAdministrators(), True),
+    ]
+    targets.extend((BotCommandScopeChat(chat_id=admin_id), True) for admin_id in sorted(ADMIN_IDS))
+    chat_id = STORE.state.get("chat_id")
+    if chat_id and int(chat_id) < 0:
+        targets.extend(
+            (BotCommandScopeChatMember(chat_id=int(chat_id), user_id=admin_id), True)
+            for admin_id in sorted(ADMIN_IDS)
+        )
+    targets.append((None, False))
+    await apply_command_menus(app, targets)
+
+
 async def post_init(app: Application) -> None:
+    await register_bot_commands(app)
     ensure_today()
     current = display_person(current_person())
     notice = (
@@ -693,9 +792,14 @@ async def send_plain(update: Update, context: ContextTypes.DEFAULT_TYPE, text: s
 @delete_command_message
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat.type in {ChatType.GROUP, ChatType.SUPERGROUP}:
-        remember_group(update.effective_chat)
+        if remember_group(update.effective_chat):
+            await register_group_commands(context.application, update.effective_chat.id)
         await send_plain(update, context, "🧹 /bugun — bugungi navbatchi\n🗓 /jadval — navbatchilik jadvali\nHar bir odamga 2 kun. E'lon navbat boshida Toshkent vaqti bilan 08:00 da yuboriladi.")
         return
+    if is_admin(update.effective_user.id):
+        await apply_command_menus(
+            context.application, [(BotCommandScopeChat(chat_id=update.effective_chat.id), True)],
+        )
     await send_plain(
         update,
         context,
@@ -735,18 +839,21 @@ async def setup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     STORE.state["last_announced_date"] = today().isoformat()
     STORE.state["last_message_id"] = sent.message_id
     STORE.save_state()
+    await register_group_commands(context.application, chat.id)
 
 
 @delete_command_message
 async def bugun(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    remember_group(update.effective_chat)
+    if remember_group(update.effective_chat):
+        await register_group_commands(context.application, update.effective_chat.id)
     markup = main_keyboard(await can_manage(update, context)) if update.effective_chat.type == ChatType.PRIVATE else None
     await send_plain(update, context, duty_message(), markup)
 
 
 @delete_command_message
 async def jadval(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    remember_group(update.effective_chat)
+    if remember_group(update.effective_chat):
+        await register_group_commands(context.application, update.effective_chat.id)
     markup = main_keyboard(await can_manage(update, context)) if update.effective_chat.type == ChatType.PRIVATE else None
     await send_plain(update, context, schedule_text(), markup)
 
