@@ -1,17 +1,21 @@
 """Navbatchilik Telegram boti. Python 3.12+, python-telegram-bot 21+."""
+import asyncio
 import io
 import json
 import logging
 import os
 import re
+import secrets
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import TelegramError
+from telegram import ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity, ReplyKeyboardMarkup, Update
+from telegram.constants import ChatMemberStatus, ChatType
+from telegram.error import BadRequest, TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
+    ChatMemberHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -32,6 +36,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 log = logging.getLogger("navbatchilik")
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 ADMIN_IDS_RAW = os.environ.get("ADMIN_IDS", "").strip()
@@ -45,7 +50,13 @@ ANNOUNCE_AT = time(8, 0, tzinfo=TZ)
 STORE = PostgresStore()
 KNOWN_COMMANDS = {
     "start", "setup", "bugun", "jadval", "bajarildi", "admin",
-    "royxat", "tarix", "zaxira", "ism_qosh", "ism_ochir",
+    "royxat", "tarix", "zaxira", "ism_qosh", "ism_ochir", "id",
+    "odamlar", "bekor", "cancel", "elon",
+}
+MENTION_PATTERN = re.compile(r"(?<![\w@])@[A-Za-z0-9_]{5,32}(?![\w@-])")
+PEOPLE_PAGE_SIZE = 10
+PEOPLE_MENU_TEXTS = {
+    "👤 Bugungi navbatchi", "🗓 Jadval", "📜 Ro'yxat", "📚 Tarix", "⚙️ Admin paneli",
 }
 
 
@@ -61,15 +72,64 @@ def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 
+async def can_manage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    user = update.effective_user
+    if not user:
+        return False
+    if is_admin(user.id):
+        return True
+    chat = update.effective_chat
+    if (
+        user.is_bot
+        or not chat
+        or chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}
+        or chat.id != STORE.state.get("chat_id")
+    ):
+        return False
+    try:
+        member = await context.bot.get_chat_member(chat_id=chat.id, user_id=user.id)
+    except TelegramError as exc:
+        log.warning("Guruh admin huquqini tekshirib bo'lmadi: %s", exc)
+        return False
+    return member.status in {ChatMemberStatus.OWNER, ChatMemberStatus.ADMINISTRATOR}
+
+
+async def require_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    if await can_manage(update, context):
+        return True
+    user_id = update.effective_user.id if update.effective_user else "noma'lum"
+    await send_plain(
+        update, context,
+        "Bu bo'lim faqat bot adminlari va ulangan guruh adminlari uchun.\n"
+        f"Sizning Telegram ID: {user_id}. Bot egasi bu ID'ni ADMIN_IDS ga qo'shishi mumkin.",
+    )
+    return False
+
+
+def mention_entities(text: str) -> list[MessageEntity]:
+    """Mark usernames explicitly; Telegram offsets count UTF-16 code units."""
+    return [
+        MessageEntity(
+            type=MessageEntity.MENTION,
+            offset=len(text[:match.start()].encode("utf-16-le")) // 2,
+            length=len(match.group()),
+        )
+        for match in MENTION_PATTERN.finditer(text)
+    ]
+
+
 def member_by_id(member_id: str | None) -> dict | None:
     return STORE.member(member_id)
 
 
 def mention(person: dict | None) -> str:
+    """Return the visible username; outgoing messages attach mention entities."""
     if not person:
         return ""
     handle = (person.get("username") or "").strip().lstrip("@")
-    return f"@{handle}" if handle else ""
+    if not handle:
+        return ""
+    return f"@{handle}"
 
 
 def display_person(person: dict | None, include_username: bool = True) -> str:
@@ -98,6 +158,47 @@ def ensure_today() -> None:
     STORE.ensure_assignment_through(today())
 
 
+def remember_group(chat) -> None:
+    """Use the first real group; changing an existing group uses /setup."""
+    if chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
+        return
+    linked = STORE.state.get("chat_id")
+    if linked is not None and int(linked) < 0:
+        return
+    STORE.state["last_announced_date"] = None
+    STORE.state["last_message_id"] = None
+    STORE.state["chat_id"] = chat.id
+    STORE.save_state()
+
+
+async def on_membership_change(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    change = update.my_chat_member
+    member = change.new_chat_member
+    if member.status in {ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR}:
+        remember_group(change.chat)
+    elif (
+        member.status in {ChatMemberStatus.LEFT, ChatMemberStatus.BANNED}
+        and change.chat.id == STORE.state.get("chat_id")
+    ):
+        STORE.state["last_announced_date"] = None
+        STORE.state["last_message_id"] = None
+        STORE.state["chat_id"] = None
+        STORE.save_state()
+
+
+async def on_group_migration(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    linked = STORE.state.get("chat_id")
+    if message.migrate_to_chat_id and linked == message.chat_id:
+        STORE.state["chat_id"] = message.migrate_to_chat_id
+    elif message.migrate_from_chat_id and linked == message.migrate_from_chat_id:
+        STORE.state["chat_id"] = message.chat_id
+    else:
+        return
+    STORE.state["last_message_id"] = None
+    STORE.save_state()
+
+
 def duty_message() -> str:
     ensure_today()
     person = current_person()
@@ -110,6 +211,7 @@ def duty_message() -> str:
         day_text = duty_date
     lines = [
         "🧹 BUGUNGI NAVBATCHI",
+        f"Davra: {STORE.state.get('round_number', 1)} · {STORE.state.get('round_position', 0)}-kun",
         "",
         f"👤 {person['name']}",
         f"📅 {day_text}",
@@ -141,7 +243,7 @@ def schedule_text() -> str:
     entries = scheduled_members()
     if not entries:
         return "✅ Joriy davrada qolgan navbatchi yo'q. Yangi davra navbatdagi kuni boshlanadi."
-    lines = ["🗓 NAVBATCHILIK JADVALI"]
+    lines = ["🗓 NAVBATCHILIK JADVALI", f"Davra: {STORE.state.get('round_number', 1)}"]
     for number, (day, person) in enumerate(entries, 1):
         if day == today():
             heading = f"🔔 BUGUN · {day.strftime('%d.%m.%Y')}"
@@ -150,6 +252,12 @@ def schedule_text() -> str:
         else:
             heading = f"📅 {day.strftime('%d.%m.%Y')}"
         lines.append(f"{number}. {heading}\n   👤 {display_person(person)}")
+    if STORE.state.get("today_duty_id") and not STORE.state.get("today_duty_done"):
+        lines.extend([
+            "",
+            "⏳ Bugungi navbatchilik bajarildi deb belgilanmasa, shu navbatchi ertaga ham qoladi "
+            "va keyingi sanalar bir kunga suriladi.",
+        ])
     if STORE.state.get("round_position", 0) >= len(STORE.state.get("round_order", [])):
         lines.extend(["", "🔀 Davra tugagach, keyingi davra yangi tartibda boshlanadi."])
     return "\n\n".join(lines)
@@ -201,27 +309,260 @@ def admin_keyboard() -> InlineKeyboardMarkup:
     if member_id and duty_date == today().isoformat() and not STORE.state.get("today_duty_done"):
         rows.append([InlineKeyboardButton("✅ Bajarildi", callback_data=f"done:{duty_date}:{member_id}")])
     rows.extend([
-        [InlineKeyboardButton("📋 Jadval", callback_data="adm:jadval")],
+        [InlineKeyboardButton("👥 Odamlarni boshqarish", callback_data="people:list")],
+        [InlineKeyboardButton("🗓 Jadval", callback_data="adm:jadval")],
         [InlineKeyboardButton("🔄 Yangi davra", callback_data="ui:reset")],
     ])
     return InlineKeyboardMarkup(rows)
 
 
+def people_page(mode: str = "list", page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
+    people = STORE.names
+    last_page = max(0, (len(people) - 1) // PEOPLE_PAGE_SIZE)
+    page = max(0, min(page, last_page))
+    start = page * PEOPLE_PAGE_SIZE
+    actions = {"list": "person", "edit": "rename", "delete": "remove"}
+    instructions = {
+        "list": "Odamni yoki quyidagi amalni tanlang.",
+        "edit": "Ismini tahrirlash uchun odamni tanlang.",
+        "delete": "O'chirish uchun odamni tanlang.",
+    }
+    lines = [f"👥 ODAMLARNI BOSHQARISH · {len(people)} kishi", instructions[mode], ""]
+    rows = []
+    for number, person in enumerate(people[start:start + PEOPLE_PAGE_SIZE], start + 1):
+        handle = person.get("username") or ""
+        lines.append(f"{number}. {person['name']}" + (f" ({handle})" if handle else ""))
+        rows.append([InlineKeyboardButton(
+            f"{number}. {person['name'][:60]}",
+            callback_data=f"people:{actions[mode]}:{person['id']}",
+        )])
+    if not people:
+        lines.append("Ro'yxat bo'sh. Odam qo'shish tugmasidan foydalaning.")
+    if last_page:
+        lines.extend(["", f"Sahifa: {page + 1}/{last_page + 1}"])
+        navigation = []
+        if page:
+            navigation.append(InlineKeyboardButton("⬅️ Oldingi", callback_data=f"people:{mode}:{page - 1}"))
+        if page < last_page:
+            navigation.append(InlineKeyboardButton("Keyingi ➡️", callback_data=f"people:{mode}:{page + 1}"))
+        rows.append(navigation)
+    rows.extend([
+        [InlineKeyboardButton("➕ Odam qo'shish", callback_data="people:add")],
+        [InlineKeyboardButton("✏️ Tahrirlash", callback_data="people:edit"),
+         InlineKeyboardButton("🗑 O'chirish", callback_data="people:delete")],
+    ])
+    if mode != "list":
+        rows.append([InlineKeyboardButton("⬅️ Ro'yxat", callback_data="people:list")])
+    rows.append([InlineKeyboardButton("⚙️ Admin paneli", callback_data="ui:admin")])
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+def clear_people_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    data = getattr(context, "user_data", None)
+    pending = data.get("people_pending") if data is not None else None
+    if pending and pending["chat_id"] == update.effective_chat.id:
+        data.pop("people_pending", None)
+
+
+def active_member(member_id: str) -> dict | None:
+    """Management only operates on the active roster, never history snapshots."""
+    return next((person for person in STORE.names if person["id"] == member_id), None)
+
+
+async def send_people_page(update: Update, context: ContextTypes.DEFAULT_TYPE, notice: str = "") -> None:
+    text, markup = people_page()
+    if notice:
+        text = notice + "\n\n" + text
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id, text=text, parse_mode=None,
+        entities=mention_entities(text), reply_markup=markup,
+    )
+
+
+async def edit_people_message(query, text: str, markup: InlineKeyboardMarkup) -> None:
+    try:
+        await query.edit_message_text(
+            text, parse_mode=None, entities=mention_entities(text), reply_markup=markup,
+        )
+    except BadRequest as exc:
+        if "message is not modified" not in str(exc).lower():
+            raise
+
+
+async def send_people_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE, instruction: str) -> None:
+    user = update.effective_user
+    text = f"{user.full_name}, {instruction}\n\nBekor qilish: /bekor"
+    prompt = await context.bot.send_message(
+        chat_id=update.effective_chat.id, text=text, parse_mode=None,
+        entities=[MessageEntity(
+            type=MessageEntity.TEXT_MENTION, offset=0,
+            length=len(user.full_name.encode("utf-16-le")) // 2, user=user,
+        )],
+        reply_markup=ForceReply(selective=True, input_field_placeholder="Ismni kiriting"),
+    )
+    context.user_data["people_pending"]["prompt_id"] = prompt.message_id
+
+
+async def on_people_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not await can_manage(update, context):
+        await query.answer("Faqat admin uchun", show_alert=True)
+        return
+    ensure_today()
+    parts = query.data.split(":", 2)
+    action = parts[1]
+    arg = parts[2] if len(parts) > 2 else ""
+    if action == "cancel":
+        pending = context.user_data.get("people_pending")
+        if not pending or pending["chat_id"] != update.effective_chat.id or pending["nonce"] != arg:
+            await query.answer("Bu so'rov sizga tegishli emas yoki eskirgan.", show_alert=True)
+            return
+        clear_people_input(update, context)
+        await query.answer("Bekor qilindi")
+        await edit_people_message(query, *people_page())
+        return
+    if action in {"list", "edit", "delete"}:
+        if arg and not re.fullmatch(r"\d{1,6}", arg):
+            await query.answer("Sahifa topilmadi.", show_alert=True)
+            return
+        clear_people_input(update, context)
+        await query.answer()
+        await edit_people_message(query, *people_page(action, int(arg or "0")))
+        return
+    person = active_member(arg) if arg else None
+    if action != "add" and (action not in {"person", "rename", "remove", "remove_yes"} or not person):
+        await query.answer("Odam topilmadi. Ro'yxatni qayta oching.", show_alert=True)
+        return
+    clear_people_input(update, context)
+    if action in {"add", "rename"}:
+        nonce = secrets.token_hex(4)
+        context.user_data["people_pending"] = {
+            "action": action, "chat_id": update.effective_chat.id, "nonce": nonce,
+            "member_id": person["id"] if person else None,
+        }
+        if action == "add":
+            instruction = "yangi odamning ism va familiyasini yuboring. Username ixtiyoriy.\nMasalan: Ali Valiyev @ali_valiyev"
+        else:
+            instruction = f"{person['name']} uchun yangi ismni yuboring."
+        await query.answer()
+        await edit_people_message(query, instruction, InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ Bekor qilish", callback_data=f"people:cancel:{nonce}")],
+        ]))
+        await send_people_prompt(update, context, instruction)
+        return
+    if action == "remove_yes":
+        try:
+            removed, was_today = STORE.remove_name(person["id"])
+        except ValueError as exc:
+            await query.answer(str(exc), show_alert=True)
+            return
+        await query.answer("O'chirildi")
+        notice = f"✅ {removed['name']} ro'yxatdan o'chirildi."
+        if was_today:
+            notice += "\n⚠️ U bugungi navbatchi edi; adminlarga xabar berdim."
+            await notify_admins(context.application, f"⚠️ Bugungi navbatchi {display_person(removed)} ro'yxatdan o'chirildi.")
+        text, markup = people_page()
+        await edit_people_message(query, notice + "\n\n" + text, markup)
+        return
+    await query.answer()
+    rows = []
+    if action == "person":
+        text = f"👤 {person['name']}"
+        if person.get("username"):
+            text += f"\n{person['username']}"
+        rows.extend([
+            [InlineKeyboardButton("✏️ Tahrirlash", callback_data=f"people:rename:{person['id']}")],
+            [InlineKeyboardButton("🗑 O'chirish", callback_data=f"people:remove:{person['id']}")],
+        ])
+    else:
+        text = f"🗑 {person['name']} ro'yxatdan o'chirilsinmi?"
+        rows.append([InlineKeyboardButton("✅ Ha, o'chirish", callback_data=f"people:remove_yes:{person['id']}")])
+    rows.append([InlineKeyboardButton("⬅️ Ro'yxat", callback_data="people:list")])
+    await edit_people_message(query, text, InlineKeyboardMarkup(rows))
+
+
+async def handle_people_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    data = getattr(context, "user_data", None)
+    pending = data.get("people_pending") if data is not None else None
+    if not pending or pending["chat_id"] != update.effective_chat.id:
+        return False
+    message = update.effective_message
+    reply = message.reply_to_message
+    if reply or update.effective_chat.type in {ChatType.GROUP, ChatType.SUPERGROUP}:
+        if not reply or reply.message_id != pending.get("prompt_id") or not reply.from_user or reply.from_user.id != context.bot.id:
+            return False
+    if not await can_manage(update, context):
+        clear_people_input(update, context)
+        await require_admin(update, context)
+        return True
+    name = message.text.strip()
+    handle = ""
+    try:
+        if "\n" in name or "\r" in name:
+            raise ValueError("Ismni bitta qatorda yuboring.")
+        if pending["action"] == "add":
+            parts = name.split()
+            if parts and parts[-1].startswith("@"):
+                handle = parts.pop()
+                if not re.fullmatch(r"@[A-Za-z0-9_]{5,32}", handle):
+                    raise ValueError("Username noto'g'ri. Masalan: @ali_valiyev. Username ixtiyoriy.")
+            name = " ".join(parts)
+        if not name:
+            raise ValueError("Ism bo'sh bo'lmasin. Ism va familiyani yuboring.")
+        if len(name) > 100:
+            raise ValueError("Ismni bitta qatorda, 100 ta belgidan oshirmay yuboring.")
+        ensure_today()
+        if pending["action"] == "add":
+            person = STORE.add_name(name, handle)
+            notice = f"✅ {person['name']} qo'shildi. Joriy davra davom etadi."
+        else:
+            if not active_member(pending["member_id"]):
+                clear_people_input(update, context)
+                await send_people_page(update, context, "⚠️ Bu odam ro'yxatdan o'chirilgan.")
+                return True
+            person = STORE.rename_name(pending["member_id"], name)
+            notice = f"✅ Ism {person['name']} deb saqlandi. Navbat tartibi saqlandi."
+    except ValueError as exc:
+        await send_people_prompt(update, context, f"{exc}\nQayta yuboring.")
+        return True
+    clear_people_input(update, context)
+    await send_people_page(update, context, notice)
+    return True
+
+
 def menu_keyboard(admin: bool = False) -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton("📅 Bugungi navbatchi", callback_data="ui:bugun")],
+        [InlineKeyboardButton("👤 Bugungi navbatchi", callback_data="ui:bugun")],
         [InlineKeyboardButton("🗓 Jadval", callback_data="ui:jadval")],
     ]
     if admin:
-        rows.append([InlineKeyboardButton("🛠 Admin paneli", callback_data="ui:admin")])
+        rows.append([InlineKeyboardButton("⚙️ Admin paneli", callback_data="ui:admin")])
     return InlineKeyboardMarkup(rows)
 
 
 def reset_confirm_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Ha, yangi davra", callback_data="ui:reset_yes")],
-        [InlineKeyboardButton("Bekor qilish", callback_data="ui:admin")],
+        [InlineKeyboardButton(
+            "✅ Ha, yangi davra",
+            callback_data=f"ui:reset_yes:{today().isoformat()}:{STORE.state.get('round_number', 1)}",
+        )],
+        [InlineKeyboardButton("❌ Bekor qilish", callback_data="ui:admin")],
     ])
+
+
+def back_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅️ Ortga", callback_data="ui:menu")]
+    ])
+
+
+def main_keyboard(admin: bool = False) -> ReplyKeyboardMarkup:
+    buttons = [
+        ["👤 Bugungi navbatchi", "🗓 Jadval"],
+    ]
+    if admin:
+        buttons.append(["⚙️ Admin paneli"])
+    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
 
 def date_at_eight_or_later() -> bool:
@@ -229,46 +570,54 @@ def date_at_eight_or_later() -> bool:
 
 
 async def notify_admins(app: Application, text: str) -> None:
-    delivered = 0
     for admin_id in sorted(ADMIN_IDS):
         try:
-            await app.bot.send_message(chat_id=admin_id, text=text)
-            delivered += 1
+            await app.bot.send_message(chat_id=admin_id, text=text, parse_mode=None, entities=mention_entities(text))
         except TelegramError as exc:
             log.warning("Admin %s ga xabar yuborilmadi: %s", admin_id, exc)
-    if delivered == 0 and STORE.state.get("chat_id"):
+
+
+async def publish_today_if_due(app: Application, *, force: bool = False) -> bool:
+    lock = app.bot_data.setdefault("announcement_lock", asyncio.Lock())
+    async with lock:
+        ensure_today()
+        if not force and not date_at_eight_or_later():
+            return False
+        key = today().isoformat()
+        if not force and STORE.state.get("last_announced_date") == key:
+            return False
+        chat_id = STORE.state.get("chat_id")
+        if not chat_id or int(chat_id) >= 0 or not STORE.state.get("today_duty_id"):
+            return False
+        assignment = (chat_id, key, STORE.state.get("round_number"), STORE.state.get("today_duty_id"))
         try:
-            await app.bot.send_message(chat_id=STORE.state["chat_id"], text=f"⚠️ Admin xabari:\n{text}")
-        except TelegramError as exc:
-            log.warning("Admin xabari guruhga ham yuborilmadi: %s", exc)
-
-
-async def publish_today_if_due(app: Application) -> None:
-    ensure_today()
-    if not date_at_eight_or_later():
-        return
-    key = today().isoformat()
-    if STORE.state.get("last_announced_date") == key:
-        return
-    chat_id = STORE.state.get("chat_id")
-    if not chat_id or not STORE.state.get("today_duty_id"):
-        return
-    try:
-        sent = await app.bot.send_message(
-            chat_id=chat_id,
-            text=duty_message(),
-            reply_markup=admin_keyboard(),
+            text = duty_message()
+            sent = await app.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode=None,
+                entities=mention_entities(text),
+                disable_notification=False,
+            )
+        except TelegramError:
+            log.exception("Bugungi navbatchi xabarini yuborib bo'lmadi; keyingi tekshiruvda qayta uriniladi")
+            return False
+        current_assignment = (
+            STORE.state.get("chat_id"), today().isoformat(),
+            STORE.state.get("round_number"), STORE.state.get("today_duty_id"),
         )
-    except TelegramError:
-        log.exception("Bugungi navbatchi xabarini yuborib bo'lmadi")
-        return
-    STORE.state["last_announced_date"] = key
-    STORE.state["last_message_id"] = sent.message_id
-    STORE.save_state()
+        if current_assignment != assignment:
+            # A reset or group switch while sending must not mark the new target delivered.
+            log.info("E'lon yuborildi, ammo guruh yoki navbat o'zgardi; yangi e'lon hali kutilmoqda")
+            return True
+        STORE.state["last_announced_date"] = key
+        STORE.state["last_message_id"] = sent.message_id
+        STORE.save_state()
+        log.info("Bugungi e'lon guruhga yuborildi: sana=%s, chat_id=%s, message_id=%s", key, chat_id, sent.message_id)
+        return True
 
 
 async def daily_announcement(context: ContextTypes.DEFAULT_TYPE) -> None:
-    STORE.ensure_assignment_through(today())
     await publish_today_if_due(context.application)
 
 
@@ -286,7 +635,7 @@ async def post_init(app: Application) -> None:
 
 
 def delete_command_message(handler):
-    """Run the command first, then remove its incoming command message."""
+    """Keep group commands visible; remove command clutter in private chats."""
     from functools import wraps
 
     @wraps(handler)
@@ -295,7 +644,7 @@ def delete_command_message(handler):
             return await handler(update, context)
         finally:
             message = update.effective_message
-            if message:
+            if message and update.effective_chat.type == ChatType.PRIVATE:
                 try:
                     await message.delete()
                 except TelegramError as exc:
@@ -307,30 +656,52 @@ async def send_plain(update: Update, context: ContextTypes.DEFAULT_TYPE, text: s
     await context.bot.send_message(
         chat_id=update.effective_chat.id,
         text=text,
+        parse_mode=None,
+        entities=mention_entities(text),
         reply_markup=reply_markup,
     )
 
 
 @delete_command_message
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat.type in {ChatType.GROUP, ChatType.SUPERGROUP}:
+        remember_group(update.effective_chat)
+        await send_plain(update, context, "🧹 /bugun — bugungi navbatchi\n🗓 /jadval — navbatchilik jadvali\nHar kuni 08:00 da bugungi navbatchi yuboriladi.")
+        return
     await send_plain(
         update,
         context,
-        "👋 Navbatchilik botiga xush kelibsiz! Kerakli bo'limni tanlang:",
-        menu_keyboard(is_admin(update.effective_user.id)),
+        "👋 Navbatchilik botiga xush kelibsiz! Tugmalardan foydalaning:",
+        main_keyboard(await can_manage(update, context)),
     )
 
 
 @delete_command_message
+async def show_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_plain(update, context, f"Sizning Telegram ID: {update.effective_user.id}")
+
+
+@delete_command_message
 async def setup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update.effective_user.id):
+    chat = update.effective_chat
+    if chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
+        await send_plain(update, context, "Botni ulash uchun /setup buyrug'ini guruhda yuboring.")
         return
-    STORE.state["chat_id"] = update.effective_chat.id
-    STORE.start_new_round_today(today())
-    text = "🔄 Yangi davra boshlandi.\n\n" + duty_message()
+    if not await require_admin(update, context):
+        return
+    already_linked = STORE.state.get("chat_id") == chat.id
+    STORE.state["chat_id"] = chat.id
+    if not already_linked:
+        STORE.state["last_announced_date"] = None
+        STORE.state["last_message_id"] = None
+    ensure_today()
+    heading = "✅ Guruh allaqachon ulangan. Joriy davra davom etadi." if already_linked else "✅ Guruh ulandi."
+    text = heading + "\n\n" + duty_message()
     sent = await context.bot.send_message(
-        chat_id=update.effective_chat.id,
+        chat_id=chat.id,
         text=text,
+        parse_mode=None,
+        entities=mention_entities(text),
         reply_markup=admin_keyboard(),
     )
     STORE.state["last_announced_date"] = today().isoformat()
@@ -340,25 +711,58 @@ async def setup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 @delete_command_message
 async def bugun(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await send_plain(update, context, duty_message())
+    remember_group(update.effective_chat)
+    markup = main_keyboard(await can_manage(update, context)) if update.effective_chat.type == ChatType.PRIVATE else None
+    await send_plain(update, context, duty_message(), markup)
 
 
 @delete_command_message
 async def jadval(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await send_plain(update, context, schedule_text())
+    remember_group(update.effective_chat)
+    markup = main_keyboard(await can_manage(update, context)) if update.effective_chat.type == ChatType.PRIVATE else None
+    await send_plain(update, context, schedule_text(), markup)
 
 
 @delete_command_message
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update.effective_user.id):
+    if not await require_admin(update, context):
         return
+    clear_people_input(update, context)
     ensure_today()
     await send_plain(update, context, "🛠 Admin paneli\n\n" + duty_message(), admin_keyboard())
 
 
 @delete_command_message
+async def odamlar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_admin(update, context):
+        return
+    clear_people_input(update, context)
+    ensure_today()
+    await send_people_page(update, context)
+
+
+@delete_command_message
+async def bekor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_admin(update, context):
+        return
+    clear_people_input(update, context)
+    await send_people_page(update, context, "So'rov bekor qilindi.")
+
+
+@delete_command_message
+async def elon(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_admin(update, context):
+        return
+    if await publish_today_if_due(context.application, force=True):
+        text = "✅ Bugungi navbatchi guruhga teg bilan e'lon qilindi."
+    else:
+        text = "⚠️ E'lon yuborilmadi. /setup bilan guruhni ulang va botning guruhda xabar yuborish huquqini tekshiring."
+    await send_plain(update, context, text)
+
+
+@delete_command_message
 async def bajarildi(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update.effective_user.id):
+    if not await require_admin(update, context):
         return
     ensure_today()
     if STORE.mark_today_done(today()):
@@ -369,21 +773,21 @@ async def bajarildi(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 @delete_command_message
 async def royxat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update.effective_user.id):
+    if not await require_admin(update, context):
         return
     await send_plain(update, context, roster_text())
 
 
 @delete_command_message
 async def tarix(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update.effective_user.id):
+    if not await require_admin(update, context):
         return
     await send_plain(update, context, history_text())
 
 
 @delete_command_message
 async def zaxira(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update.effective_user.id):
+    if not await require_admin(update, context):
         return
     target = update.effective_user.id
 
@@ -421,7 +825,7 @@ async def zaxira(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 @delete_command_message
 async def ism_qosh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update.effective_user.id):
+    if not await require_admin(update, context):
         return
     args = list(context.args)
     handle = ""
@@ -441,13 +845,15 @@ async def ism_qosh(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 @delete_command_message
 async def ism_ochir(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update.effective_user.id):
+    if not await require_admin(update, context):
         return
     if not context.args:
         await send_plain(update, context, "Ishlatish: /ism_ochir 3  (/royxat dagi raqam)")
         return
     try:
         number = int(context.args[0])
+        if number < 1:
+            raise ValueError("Noto'g'ri raqam")
         person = STORE.names[number - 1]
         removed, was_today = STORE.remove_name(person["id"])
     except (ValueError, IndexError):
@@ -501,9 +907,12 @@ async def member_lookup_response(
         return
     duty = member_duty(person["id"])
     if duty is None:
+        text = f"👤 {display_person(person)} joriy davrada qolmagan. Keyingi davrada navbat oladi."
         await context.bot.send_message(
             chat_id=message.chat_id,
-            text=f"👤 {display_person(person)} joriy davrada qolmagan. Keyingi davrada navbat oladi.",
+            text=text,
+            parse_mode=None,
+            entities=mention_entities(text),
         )
         return
     day, place = duty
@@ -513,20 +922,50 @@ async def member_lookup_response(
         delta = (day - today()).days
         when = "ertaga" if delta == 1 else f"{delta} kundan keyin"
         result = f"👤 {display_person(person)}\n📅 Navbati: {day.strftime('%d.%m.%Y')} ({when})\nOldida {place} kishi bor."
-    await context.bot.send_message(chat_id=message.chat_id, text=result)
+    await context.bot.send_message(chat_id=message.chat_id, text=result, parse_mode=None, entities=mention_entities(result))
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     if not message or not message.text:
         return
-    first = message.text.split()[0]
+    text = message.text.strip()
+    if text.startswith("/") or text in PEOPLE_MENU_TEXTS:
+        clear_people_input(update, context)
+    elif await handle_people_input(update, context):
+        return
+    if not text:
+        return
+    # Handle ReplyKeyboardMarkup buttons
+    if text == "👤 Bugungi navbatchi":
+        await bugun(update, context)
+        return
+    if text == "🗓 Jadval":
+        await jadval(update, context)
+        return
+    if text == "📜 Ro'yxat":
+        await royxat(update, context)
+        return
+    if text == "📚 Tarix":
+        await tarix(update, context)
+        return
+    if text == "⚙️ Admin paneli":
+        await admin_panel(update, context)
+        return
+
+    if update.effective_chat.type in {ChatType.GROUP, ChatType.SUPERGROUP}:
+        return
+    first = text.split()[0]
     command = first.split("@")[0].lstrip("/").casefold()
     is_command = first.startswith("/")
     if is_command and command in KNOWN_COMMANDS:
         return
     bot_name = (context.bot.username or "").casefold()
-    mentioned = f"@{bot_name}" in message.text.casefold()
+    mentioned = bool(bot_name) and bool(re.search(
+        rf"(?<![\w@])@{re.escape(bot_name)}(?![\w@])", message.text, flags=re.IGNORECASE
+    ))
+    if is_command and "@" in first and first.split("@", 1)[1].casefold() != bot_name:
+        return
     replied = (
         message.reply_to_message
         and message.reply_to_message.from_user
@@ -546,47 +985,57 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    ensure_today()
     kind, _, arg = query.data.partition(":")
+    if kind == "people":
+        await on_people_button(update, context)
+        return
+    ensure_today()
 
     if kind == "ui":
-        if arg in {"admin", "reset", "reset_yes"} and not is_admin(query.from_user.id):
+        action = arg.split(":", 1)[0]
+        if action in {"admin", "reset", "reset_yes"} and not await can_manage(update, context):
             await query.answer("Faqat admin uchun", show_alert=True)
             return
+        if action == "reset_yes":
+            expected = f"reset_yes:{today().isoformat()}:{STORE.state.get('round_number', 1)}"
+            if arg != expected:
+                await query.answer("Bu tasdiqlash eskirgan. Admin panelini qayta oching.", show_alert=True)
+                return
         await query.answer()
-        if arg == "menu":
+        clear_people_input(update, context)
+        if action == "menu":
             await query.edit_message_text(
-                "👋 Kerakli bo'limni tanlang:", reply_markup=menu_keyboard(is_admin(query.from_user.id))
+                "👋 Kerakli bo'limni tanlang:", reply_markup=menu_keyboard(await can_manage(update, context))
             )
             return
-        if arg == "admin":
+        if action == "admin":
             text, markup = "🛠 Admin paneli\n\n" + duty_message(), admin_keyboard()
-        elif arg == "bugun":
+        elif action == "bugun":
             text, markup = duty_message(), back_keyboard()
-        elif arg == "jadval":
+        elif action == "jadval":
             text, markup = schedule_text(), back_keyboard()
-        elif arg == "reset":
+        elif action == "reset":
             text, markup = "Yangi davra boshlaymi? Joriy davra va uning tartibi yakunlanadi.", reset_confirm_keyboard()
-        elif arg == "reset_yes":
+        elif action == "reset_yes":
             STORE.start_new_round_today(today())
             text, markup = "🔄 Yangi davra boshlandi.\n\n" + duty_message(), admin_keyboard()
-            STORE.state["last_announced_date"] = today().isoformat()
-            STORE.save_state()
+            await publish_today_if_due(context.application)
         else:
             text, markup = "Bo'lim topilmadi.", back_keyboard()
-        await query.edit_message_text(text, reply_markup=markup)
+        await query.edit_message_text(text, parse_mode=None, entities=mention_entities(text), reply_markup=markup)
         return
 
     if kind == "adm":
-        if not is_admin(query.from_user.id):
+        if not await can_manage(update, context):
             await query.answer("Faqat admin uchun", show_alert=True)
             return
         await query.answer()
-        await query.edit_message_text(schedule_text(), reply_markup=back_keyboard())
+        text = schedule_text()
+        await query.edit_message_text(text, parse_mode=None, entities=mention_entities(text), reply_markup=back_keyboard())
         return
 
     if kind == "done":
-        if not is_admin(query.from_user.id):
+        if not await can_manage(update, context):
             await query.answer("Faqat admin belgilay oladi", show_alert=True)
             return
         try:
@@ -613,21 +1062,28 @@ def main() -> None:
 
     app = Application.builder().token(TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("id", show_id))
     app.add_handler(CommandHandler("setup", setup))
     app.add_handler(CommandHandler("bugun", bugun))
     app.add_handler(CommandHandler("jadval", jadval))
     app.add_handler(CommandHandler("admin", admin_panel))
+    app.add_handler(CommandHandler("elon", elon))
+    app.add_handler(CommandHandler("odamlar", odamlar))
+    app.add_handler(CommandHandler(["bekor", "cancel"], bekor))
     app.add_handler(CommandHandler("bajarildi", bajarildi))
     app.add_handler(CommandHandler("royxat", royxat))
     app.add_handler(CommandHandler("tarix", tarix))
     app.add_handler(CommandHandler("zaxira", zaxira))
     app.add_handler(CommandHandler("ism_qosh", ism_qosh))
     app.add_handler(CommandHandler("ism_ochir", ism_ochir))
-    app.add_handler(CallbackQueryHandler(on_button, pattern=r"^(done|adm|ui):"))
+    app.add_handler(CallbackQueryHandler(on_button, pattern=r"^(done|adm|ui|people):"))
+    app.add_handler(ChatMemberHandler(on_membership_change, ChatMemberHandler.MY_CHAT_MEMBER))
+    app.add_handler(MessageHandler(filters.StatusUpdate.MIGRATE, on_group_migration))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text), group=1)
     app.add_handler(MessageHandler(filters.COMMAND, on_text), group=1)
-    app.job_queue.run_daily(daily_announcement, ANNOUNCE_AT)
-    app.run_polling()
+    app.job_queue.run_daily(daily_announcement, ANNOUNCE_AT, name="daily_announcement")
+    app.job_queue.run_repeating(daily_announcement, interval=60, first=10, name="announcement_retry")
+    app.run_polling(allowed_updates=[Update.MESSAGE, Update.CALLBACK_QUERY, Update.MY_CHAT_MEMBER])
 
 
 if __name__ == "__main__":

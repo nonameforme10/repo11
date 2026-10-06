@@ -3,7 +3,7 @@ module.exports = {
     {
       name: "navbatchilik-bot",
       script: "bot.py",
-      interpreter: "python3",
+      interpreter: "/root/repo11/venv/bin/python",
       // Restart automatically if it crashes
       autorestart: true,
       watch: false,

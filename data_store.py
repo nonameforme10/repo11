@@ -18,8 +18,6 @@ from psycopg2.extensions import connection as PgConnection
 log = logging.getLogger(__name__)
 TZ = ZoneInfo("Asia/Tashkent")
 
-DATABASE_URL = os.environ.get("DATABASE_URL", "")
-
 # Fallback list used only when no JSON files exist at all on first run.
 DEFAULT_NAMES = [
     {"name": "Mamadaliyev Hojakbar", "username": "@xojiakbar_01010"},
@@ -122,8 +120,11 @@ def _load_canonical_members() -> list[dict]:
 
 
 def _get_conn() -> PgConnection:
-    """Return a new psycopg2 connection using DATABASE_URL."""
-    return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+    """Return a new psycopg2 connection using DATABASE_URL (read lazily from env)."""
+    url = os.environ.get("DATABASE_URL", "")
+    if not url:
+        raise RuntimeError("DATABASE_URL is not set. Add it to .env and restart.")
+    return psycopg2.connect(url, cursor_factory=psycopg2.extras.RealDictCursor)
 
 
 def iso_day(value: date) -> str:
@@ -283,7 +284,7 @@ class PostgresStore:
         """No-op: history is written immediately via _HistoryProxy.__setitem__."""
 
     def save_names(self) -> None:
-        """No-op: names are written immediately via add_name / remove_name."""
+        """No-op: names are written immediately via add_name / rename_name / remove_name."""
 
     # ------------------------------------------------------------------
     # Reconcile & cleanup
@@ -382,9 +383,13 @@ class PostgresStore:
         self._set_state_key("round_position", "0")
         round_number = int(self._get_state_key("round_number", "0") or "0") + 1
         self._set_state_key("round_number", str(round_number))
-        self._commit()
 
     def _assign_day(self, day: date, overwrite: bool = False) -> None:
+        """Save the day's assignment and round state in one transaction."""
+        with self._conn:
+            self._assign_day_in_transaction(day, overwrite=overwrite)
+
+    def _assign_day_in_transaction(self, day: date, overwrite: bool = False) -> None:
         key = iso_day(day)
         if not overwrite:
             with self._cur() as cur:
@@ -400,7 +405,6 @@ class PostgresStore:
                 self._set_state_key("today_duty_done", "true" if existing["done"] else "false")
                 self._set_state_key("last_member_id", existing["member_id"])
                 self._set_state_key("last_assigned_date", key)
-                self._commit()
                 return
 
         names = self.names
@@ -428,21 +432,34 @@ class PostgresStore:
                     """,
                     (key, None, "Navbatchi ro'yxati bo'sh", "", round_number, 0, order, False),
                 )
-            self._commit()
             return
 
         order_str = self._get_state_key("round_order", "")
         order = [mid for mid in (order_str or "").split(",") if mid]
         position = int(self._get_state_key("round_position", "0") or "0")
-        if not order or position >= len(order):
-            self._start_round()
-            order_str = self._get_state_key("round_order", "")
-            order = [mid for mid in (order_str or "").split(",") if mid]
-            position = 0
-
-        member_id = order[position]
-        position += 1
+        previous_id = self._get_state_key("today_duty_id")
+        previous_date = self._get_state_key("today_duty_date")
+        carry_over = (
+            not overwrite
+            and previous_date is not None
+            and previous_date < key
+            and self._get_state_key("today_duty_done", "false") != "true"
+            and any(person["id"] == previous_id for person in names)
+        )
+        if carry_over:
+            # The cursor already points past this person. Keep the queue waiting
+            # until an admin confirms completion, even at the end of a round.
+            member_id = previous_id
+        else:
+            if not order or position >= len(order):
+                self._start_round()
+                order_str = self._get_state_key("round_order", "")
+                order = [mid for mid in (order_str or "").split(",") if mid]
+                position = 0
+            member_id = order[position]
+            position += 1
         round_number = int(self._get_state_key("round_number", "1") or "1")
+        snapshot = self.member_snapshot(member_id)
 
         with self._cur() as cur:
             cur.execute(
@@ -461,8 +478,8 @@ class PostgresStore:
                 (
                     key,
                     member_id,
-                    self.member_snapshot(member_id)["name"],
-                    self.member_snapshot(member_id)["username"],
+                    snapshot["name"],
+                    snapshot["username"],
                     round_number,
                     position,
                     order,
@@ -475,7 +492,6 @@ class PostgresStore:
         self._set_state_key("today_duty_id", member_id)
         self._set_state_key("today_duty_date", key)
         self._set_state_key("today_duty_done", "false")
-        self._commit()
 
     def ensure_assignment_through(self, target: date) -> None:
         last_text = self._get_state_key("last_assigned_date")
@@ -496,32 +512,38 @@ class PostgresStore:
             day += timedelta(days=1)
 
     def start_new_round_today(self, today: date) -> None:
-        self._start_round()
-        self._set_state_key("round_position", "0")
-        self._set_state_key("last_assigned_date", (today - timedelta(days=1)).isoformat())
-        self._set_state_key("last_announced_date", None)
-        self._set_state_key("today_duty_id", None)
-        self._set_state_key("today_duty_date", None)
-        self._set_state_key("today_duty_done", "false")
-        self._commit()
-        self._assign_day(today, overwrite=True)
+        """Replace today's duty and advance the round atomically."""
+        with self._conn:
+            self._start_round()
+            self._set_state_key("round_position", "0")
+            self._set_state_key("last_assigned_date", (today - timedelta(days=1)).isoformat())
+            self._set_state_key("last_announced_date", None)
+            self._set_state_key("today_duty_id", None)
+            self._set_state_key("today_duty_date", None)
+            self._set_state_key("today_duty_done", "false")
+            self._assign_day_in_transaction(today, overwrite=True)
 
     def mark_today_done(self, today: date) -> bool:
+        """Confirm completion in state and history together before advancing."""
         key = self._get_state_key("today_duty_date")
         member_id = self._get_state_key("today_duty_id")
         if not key or key != today.isoformat() or not member_id:
             return False
-        self._set_state_key("today_duty_done", "true")
-        with self._cur() as cur:
-            cur.execute(
-                "UPDATE duty_history SET done = TRUE WHERE duty_date = %s",
-                (key,),
-            )
-        self._commit()
+        with self._conn:
+            self._set_state_key("today_duty_done", "true")
+            with self._cur() as cur:
+                cur.execute(
+                    "UPDATE duty_history SET done = TRUE WHERE duty_date = %s",
+                    (key,),
+                )
         return True
 
     def add_name(self, name: str, username: str = "") -> dict[str, str]:
         normalized = name.strip()
+        if not normalized:
+            raise ValueError("Ism bo'sh bo'lishi mumkin emas.")
+        if len(normalized) > 100:
+            raise ValueError("Ism 100 ta belgidan oshmasligi kerak.")
         existing = self.names
         if any(p["name"].casefold() == normalized.casefold() for p in existing):
             raise ValueError("Bu ism ro'yxatda bor.")
@@ -543,6 +565,37 @@ class PostgresStore:
         self._set_state_key("round_order", ",".join(order))
         self._commit()
         return {"id": member_id, "name": normalized, "username": handle}
+
+    def rename_name(self, member_id: str, name: str) -> dict[str, str]:
+        """Rename an active member and today's snapshot without changing their place."""
+        normalized = name.strip()
+        if not normalized:
+            raise ValueError("Ism bo'sh bo'lishi mumkin emas.")
+        if len(normalized) > 100:
+            raise ValueError("Ism 100 ta belgidan oshmasligi kerak.")
+
+        with self._conn:
+            with self._cur() as cur:
+                cur.execute(
+                    "SELECT id, name, username FROM members WHERE id = %s FOR UPDATE",
+                    (member_id,),
+                )
+                person = cur.fetchone()
+                if person is None:
+                    raise ValueError("Ism topilmadi.")
+                cur.execute("SELECT id, name FROM members WHERE id <> %s", (member_id,))
+                if any(row["name"].casefold() == normalized.casefold() for row in cur.fetchall()):
+                    raise ValueError("Bu ism ro'yxatda bor.")
+                cur.execute(
+                    "UPDATE members SET name = %s WHERE id = %s RETURNING id, name, username",
+                    (normalized, member_id),
+                )
+                renamed = dict(cur.fetchone())
+                cur.execute(
+                    "UPDATE duty_history SET name = %s WHERE duty_date = %s AND member_id = %s",
+                    (normalized, tashkent_today().isoformat(), member_id),
+                )
+        return renamed
 
     def remove_name(self, member_id: str) -> tuple[dict[str, str], bool]:
         person = next((p for p in self.names if p["id"] == member_id), None)
